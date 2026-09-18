@@ -1,0 +1,677 @@
+* { box-sizing: border-box; margin: 0; padding: 0; }
+
+:root {
+  --bg: #1a1210;
+  --bg-raised: #241c18;
+  --card: #2a2019;
+  --card-hover: #32261e;
+  --text: #f0e4da;
+  --muted: #a08878;
+  --border: #3a2e26;
+  --accent: #e07a5f;
+  --accent-2: #f4a261;
+  --warn: #f4a261;
+  --danger: #c0392b;
+  --radius: 8px;
+  --radius-sm: 6px;
+  --gap-xs: 4px;
+  --gap-sm: 6px;
+  --gap-md: 8px;
+  --gap-lg: 12px;
+}
+
+html, body {
+  margin: 0;
+  padding: 0;
+  width: 100%;
+  height: 100%;
+  overflow: hidden;
+  font-family: Inter, -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+  font-size: 13px;
+  color: var(--text);
+  background: var(--bg);
+  -webkit-font-smoothing: antialiased;
+}
+
+::-webkit-scrollbar { width: 0; height: 0; }
+* { scrollbar-width: none; }
+
+#cn-root {
+  display: flex;
+  flex-direction: column;
+  height: 100%;
+  width: 100%;
+  overflow: hidden;
+}
+
+/* ---- VIEWS ---- */
+.cn-view {
+  display: flex;
+  flex-direction: column;
+  height: 100%;
+  width: 100%;
+}
+
+/* ---- HEADER ---- */
+.cn-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 10px 12px;
+  background: linear-gradient(135deg, var(--accent), var(--accent-2));
+  flex-shrink: 0;
+  gap: 8px;
+}
+.cn-header-left {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  min-width: 0;
+}
+.cn-title {
+  font-size: 15px;
+  font-weight: 800;
+  letter-spacing: 0.3px;
+  color: #fff;
+}
+.cn-subtitle {
+  font-size: 11px;
+  color: rgba(255,255,255,0.7);
+}
+.cn-muted {
+  color: var(--muted);
+  font-weight: 400;
+  font-size: 11px;
+}
+.cn-header-center {
+  flex: 1;
+  min-width: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 1px;
+}
+.cn-note-title-display {
+  font-size: 13px;
+  font-weight: 700;
+  color: #fff;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.cn-header-video-info {
+  font-size: 10px;
+  color: rgba(255,255,255,0.6);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.cn-header-right {
+  display: flex;
+  gap: var(--gap-sm);
+  flex-shrink: 0;
+}
+.cn-header-btn {
+  background: rgba(255,255,255,0.2);
+  color: #fff;
+  border: 1px solid rgba(255,255,255,0.3);
+  padding: 4px 8px;
+  border-radius: var(--radius-sm);
+  cursor: pointer;
+  font-size: 11px;
+  font-weight: 600;
+  transition: background 0.15s ease;
+  line-height: 1;
+  white-space: nowrap;
+}
+.cn-header-btn:hover {
+  background: rgba(255,255,255,0.35);
+}
+.cn-back-btn {
+  background: rgba(255,255,255,0.2);
+  color: #fff;
+  border: 1px solid rgba(255,255,255,0.3);
+  width: 28px;
+  height: 28px;
+  border-radius: var(--radius-sm);
+  cursor: pointer;
+  font-size: 14px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  transition: background 0.15s ease;
+  flex-shrink: 0;
+}
+.cn-back-btn:hover {
+  background: rgba(255,255,255,0.35);
+}
+
+/* ---- SECTION LABEL ---- */
+.cn-section-label {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 8px 12px 4px;
+  font-size: 11px;
+  font-weight: 700;
+  text-transform: uppercase;
+  letter-spacing: 0.5px;
+  color: var(--muted);
+  flex-shrink: 0;
+}
+
+/* ---- LISTS (scrollable) ---- */
+.cn-notes-list,
+.cn-home-list {
+  flex: 1 1 0;
+  min-height: 0;
+  overflow-y: auto;
+  overflow-x: hidden;
+  padding: 4px 10px;
+  display: flex;
+  flex-direction: column;
+  gap: var(--gap-md);
+}
+
+/* ---- HOME NOTE CARD ---- */
+.cn-home-card {
+  display: flex;
+  align-items: center;
+  gap: var(--gap-md);
+  background: var(--card);
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  padding: 10px 12px;
+  cursor: pointer;
+  transition: background 0.15s ease;
+}
+.cn-home-card:hover {
+  background: var(--card-hover);
+}
+.cn-home-card-icon {
+  font-size: 18px;
+  color: var(--accent);
+  flex-shrink: 0;
+  width: 24px;
+  text-align: center;
+}
+.cn-home-card-info {
+  flex: 1;
+  min-width: 0;
+}
+.cn-home-card-title {
+  font-size: 13px;
+  font-weight: 600;
+  color: var(--text);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.cn-home-card-meta {
+  font-size: 11px;
+  color: var(--muted);
+  margin-top: 2px;
+}
+.cn-home-card-actions {
+  display: flex;
+  gap: 2px;
+  flex-shrink: 0;
+}
+.cn-home-action {
+  background: none;
+  border: none;
+  color: var(--muted);
+  cursor: pointer;
+  font-size: 13px;
+  padding: 4px 6px;
+  border-radius: 4px;
+  line-height: 1;
+  transition: color 0.15s, background 0.15s;
+}
+.cn-home-action:hover {
+  color: var(--text);
+  background: rgba(255,255,255,0.08);
+}
+.cn-home-action.cn-danger:hover {
+  color: var(--danger);
+  background: rgba(192,57,43,0.15);
+}
+
+/* Inline rename input */
+.cn-rename-input {
+  font-size: 13px;
+  font-weight: 600;
+  font-family: inherit;
+  color: var(--text);
+  background: var(--bg-raised);
+  border: 1px solid var(--accent);
+  border-radius: 4px;
+  padding: 2px 6px;
+  width: 100%;
+  outline: none;
+}
+
+/* ---- MOMENT CARD (note detail) ---- */
+.cn-note-card {
+  display: flex;
+  gap: var(--gap-md);
+  background: var(--card);
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  padding: var(--gap-md);
+  position: relative;
+  transition: background 0.15s ease;
+}
+.cn-note-card:hover {
+  background: var(--card-hover);
+}
+/* Drag handle on the left edge of each moment card. */
+.cn-drag-handle {
+  /* Stretch across the card's full height. */
+  align-self: stretch;
+  /* Center the grip dots vertically. */
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  /* The familiar "grab" cursor. */
+  cursor: grab;
+  /* Muted like the other quiet controls. */
+  color: var(--muted);
+  /* Slightly larger than the glyph's default size. */
+  font-size: 13px;
+  /* Breathing room between the two grip columns. */
+  letter-spacing: 2px;
+  /* No selectable text while dragging. */
+  user-select: none;
+  /* Leave touch/pointer gestures alone otherwise. */
+  touch-action: none;
+  /* A little inner padding. */
+  padding: 0 2px;
+  /* Rounded hover background. */
+  border-radius: 4px;
+  transition: color 0.15s, background 0.15s;
+}
+.cn-drag-handle:hover {
+  /* Warm accent on hover so it reads as interactive. */
+  color: var(--accent);
+  /* A faint raised background. */
+  background: rgba(255, 255, 255, 0.06);
+}
+.cn-drag-handle:active {
+  /* Show "grabbing" while the handle is held. */
+  cursor: grabbing;
+}
+/* The card currently being dragged. */
+.cn-note-card.cn-dragging {
+  /* Slightly fade the moving card. */
+  opacity: 0.8;
+  /* Lift it with a soft shadow. */
+  box-shadow: 0 8px 20px rgba(0, 0, 0, 0.45);
+  /* Raise it above its neighbours. */
+  z-index: 5;
+  /* A touch brighter while in motion. */
+  background: var(--card-hover);
+}
+/* The thin line marking where the card will land. */
+.cn-drop-indicator {
+  /* A short accent-coloured divider. */
+  height: 2px;
+  /* Round its ends. */
+  border-radius: 2px;
+  /* The theme's orange/peach gradient. */
+  background: linear-gradient(135deg, var(--accent), #e9a87c);
+  /* A soft glow so it reads as an insertion point. */
+  box-shadow: 0 0 6px rgba(224, 122, 95, 0.55);
+  /* Keep it out of the card flow's width. */
+  flex-shrink: 0;
+  /* Pull it slightly into the gaps around it. */
+  margin: 2px 0;
+}
+.cn-note-thumb {
+  flex-shrink: 0;
+  width: 110px;
+}
+.cn-note-thumb img {
+  display: block;
+  width: 110px;
+  height: 62px;
+  object-fit: cover;
+  border-radius: var(--radius-sm);
+  background: var(--bg-raised);
+}
+.cn-note-content {
+  flex: 1;
+  min-width: 0;
+  display: flex;
+  flex-direction: column;
+  gap: var(--gap-xs);
+}
+.cn-note-top {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: var(--gap-sm);
+}
+.cn-note-time {
+  font-size: 12px;
+  font-weight: 700;
+  color: var(--accent-2);
+  cursor: pointer;
+  white-space: nowrap;
+}
+.cn-note-time:hover {
+  text-decoration: underline;
+}
+.cn-note-delete {
+  background: none;
+  border: none;
+  color: var(--muted);
+  cursor: pointer;
+  font-size: 13px;
+  padding: 2px 4px;
+  border-radius: 4px;
+  line-height: 1;
+  transition: color 0.15s ease, background 0.15s ease;
+  flex-shrink: 0;
+}
+.cn-note-delete:hover {
+  color: var(--danger);
+  background: rgba(192,57,43,0.15);
+}
+/* Save-state line shown on moment cards when the file couldn't be written. */
+.cn-save-status {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  flex-wrap: wrap;
+  font-size: 11px;
+  min-height: 0;
+}
+.cn-warn {
+  color: var(--warn);
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+}
+.cn-status-btn {
+  background: rgba(240,164,58,0.14);
+  color: var(--warn);
+  border: 1px solid rgba(240,164,58,0.4);
+  border-radius: 4px;
+  padding: 2px 8px;
+  font-size: 10.5px;
+  font-weight: 600;
+  cursor: pointer;
+}
+.cn-status-btn:hover { background: rgba(240,164,58,0.25); }
+.cn-note-textarea {
+  width: 100%;
+  min-height: 52px;
+  max-height: 120px;
+  resize: vertical;
+  padding: 6px 8px;
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+  font-family: inherit;
+  font-size: 12px;
+  line-height: 1.45;
+  background: var(--bg-raised);
+  color: var(--text);
+  transition: border-color 0.15s ease;
+}
+.cn-note-textarea::placeholder {
+  color: var(--muted);
+  opacity: 0.6;
+}
+.cn-note-textarea:focus {
+  outline: none;
+  border-color: var(--accent);
+}
+
+/* ---- EMPTY STATE ---- */
+.cn-empty {
+  display: none;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  text-align: center;
+  padding: 32px 20px;
+  gap: var(--gap-sm);
+  flex: 1 1 0;
+}
+.cn-empty.visible {
+  display: flex;
+}
+.cn-empty-icon {
+  font-size: 28px;
+  color: var(--accent);
+  opacity: 0.6;
+  margin-bottom: 4px;
+}
+.cn-empty-text {
+  font-size: 13px;
+  font-weight: 600;
+  color: var(--text);
+}
+.cn-empty-sub {
+  font-size: 11px;
+  color: var(--muted);
+  line-height: 1.4;
+  max-width: 200px;
+}
+
+/* ---- CAPTURE BAR ---- */
+.cn-capture-bar {
+  padding: var(--gap-md) 12px;
+  flex-shrink: 0;
+}
+/* Home view: the New Note button with the LinkedIn link on the far right. */
+.cn-home-capture-row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+}
+/* Home view only: keep the New Note button at its content width instead of
+   stretching across the row, so it stays smaller than the LinkedIn icon row. */
+#cn-home-new {
+  flex: 0 0 auto;
+}
+.cn-linkedin-link {
+  flex-shrink: 0;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 28px;
+  height: 28px;
+  border-radius: var(--radius-sm);
+  color: var(--muted);
+  opacity: 0.8;
+  transition: color 0.15s ease, background 0.15s ease, opacity 0.15s ease;
+}
+.cn-linkedin-link svg {
+  display: block;
+  width: 18px;
+  height: 18px;
+}
+.cn-linkedin-link:hover {
+  color: var(--text);
+  background: rgba(255, 255, 255, 0.08);
+  opacity: 1;
+}
+.cn-linkedin-link:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 2px;
+  color: var(--text);
+  opacity: 1;
+}
+.cn-capture-row {
+  display: flex;
+  gap: 6px;
+  margin-top: 6px;
+}
+.cn-capture-btn {
+  flex: 1;
+  background: linear-gradient(135deg, var(--accent), var(--accent-2));
+  color: #fff;
+  border: none;
+  border-radius: var(--radius);
+  padding: 8px 12px;
+  font-size: 12px;
+  font-weight: 700;
+  cursor: pointer;
+  transition: filter 0.15s ease, transform 0.1s ease;
+  white-space: nowrap;
+}
+.cn-capture-btn:hover {
+  filter: brightness(1.1);
+}
+.cn-capture-btn:active {
+  transform: scale(0.98);
+}
+/* The secondary "Screenshot" action: an outlined card-style button so it
+   reads as a different kind of capture than the primary "+ Capture". */
+.cn-shot-btn {
+  background: var(--card);
+  border: 1px solid var(--accent);
+  color: var(--accent);
+}
+.cn-shot-btn:hover {
+  background: var(--card-hover);
+}
+.cn-capture-btn:disabled {
+  opacity: 0.5;
+  cursor: not-allowed;
+  filter: none;
+  transform: none;
+}
+
+/* ---- SCREENSHOTS SECTION (home view) ---- */
+.cn-shots-section {
+  padding: 4px 10px 0;
+  display: flex;
+  flex-direction: column;
+  flex-shrink: 0;
+}
+.cn-shots-list {
+  flex: 0 1 auto;
+  max-height: 40vh;
+  min-height: 0;
+  overflow-y: auto;
+  overflow-x: hidden;
+  display: flex;
+  flex-direction: column;
+  gap: var(--gap-sm);
+  padding: 2px 0;
+}
+.cn-shot-card {
+  display: flex;
+  align-items: center;
+  gap: var(--gap-md);
+  background: var(--card);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+  padding: 6px 8px;
+  cursor: zoom-in;
+  transition: background 0.15s ease;
+}
+.cn-shot-card:hover {
+  background: var(--card-hover);
+}
+.cn-shot-thumb {
+  flex-shrink: 0;
+  width: 60px;
+  height: 40px;
+  object-fit: cover;
+  border-radius: 4px;
+  background: var(--bg-raised);
+}
+.cn-shot-thumb.cn-shot-missing {
+  opacity: 0.35;
+}
+.cn-shot-info {
+  flex: 1;
+  min-width: 0;
+}
+.cn-shot-title {
+  font-size: 12px;
+  font-weight: 600;
+  color: var(--text);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.cn-shot-meta {
+  font-size: 11px;
+  color: var(--muted);
+  margin-top: 1px;
+}
+.cn-shot-delete {
+  background: none;
+  border: none;
+  color: var(--muted);
+  cursor: pointer;
+  font-size: 13px;
+  padding: 4px 6px;
+  border-radius: 4px;
+  line-height: 1;
+  transition: color 0.15s ease, background 0.15s ease;
+  flex-shrink: 0;
+}
+.cn-shot-delete:hover {
+  color: var(--danger);
+  background: rgba(192,57,43,0.15);
+}
+
+/* ---- FOOTER ---- */
+.cn-footer {
+  padding: 4px 12px 8px;
+  font-size: 11px;
+  flex-shrink: 0;
+}
+
+/* ---- UTILITY ---- */
+.cn-hidden {
+  display: none !important;
+}
+
+/* ---- MOMENT IMAGE PREVIEW ---- */
+.cn-note-thumb-clickable {
+  cursor: zoom-in;
+}
+.cn-preview-overlay {
+  position: fixed;
+  inset: 0;
+  z-index: 9999;
+  background: rgba(0, 0, 0, 0.92);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  cursor: zoom-out;
+}
+.cn-preview-img {
+  max-width: 100%;
+  max-height: 100%;
+  object-fit: contain;
+  border-radius: var(--radius);
+  box-shadow: 0 0 24px rgba(0, 0, 0, 0.6);
+}
+.cn-preview-close {
+  position: absolute;
+  top: 10px;
+  right: 10px;
+  width: 30px;
+  height: 30px;
+  border: 0;
+  border-radius: 50%;
+  background: rgba(255, 255, 255, 0.16);
+  color: var(--text);
+  font-size: 15px;
+  line-height: 1;
+  cursor: pointer;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+}
+.cn-preview-close:hover {
+  background: rgba(255, 255, 255, 0.34);
+}

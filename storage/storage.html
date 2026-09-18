@@ -1,0 +1,130 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Storage - ClipNote</title>
+    <link rel="stylesheet" href="storage.css" />
+  </head>
+  <body>
+    <div id="storage-root">
+      <!-- ===== HEADER ===== -->
+      <header class="storage-header">
+        <button id="btn-back" class="storage-back" title="Back">&#x2190; Back</button>
+        <div class="storage-title">Storage</div>
+      </header>
+
+      <!-- ===== LOCAL STORAGE ===== -->
+      <section class="storage-section">
+        <h2 class="section-title">Local Screenshot Storage</h2>
+        <p class="section-note">
+          Your screenshots are stored directly on your computer. ClipNote remembers
+          the folder, so you only choose it once.
+        </p>
+
+        <!-- CONNECTED CARD -->
+        <div id="card-connected" class="folder-card connected hidden">
+          <div class="folder-row">
+            <span class="folder-icon">&#128193;</span>
+            <div>
+              <div id="folder-name" class="folder-name"></div>
+              <div class="folder-meta">&#128994; Folder Connected</div>
+            </div>
+          </div>
+          <div class="folder-actions">
+            <button id="btn-change" class="btn">Change Folder</button>
+            <button id="btn-test" class="btn btn-ghost">Test Folder</button>
+          </div>
+          <div id="test-msg" class="line-msg hidden"></div>
+        </div>
+
+        <!-- NO FOLDER CARD -->
+        <div id="card-empty" class="folder-card empty hidden">
+          <div class="folder-row">
+            <span class="folder-icon">&#128193;</span>
+            <div>
+              <div class="folder-name">No screenshot folder connected.</div>
+              <div class="folder-meta">Choose a folder where ClipNote will permanently store your screenshots.</div>
+            </div>
+          </div>
+          <div class="folder-actions">
+            <button id="btn-choose" class="btn btn-primary">Choose Folder</button>
+          </div>
+        </div>
+
+        <!-- PERMISSION CARD -->
+        <div id="card-permission" class="folder-card warning hidden">
+          <div class="folder-row">
+            <span class="folder-icon">&#128193;</span>
+            <div>
+              <div id="permission-heading" class="folder-name">Folder Permission Required</div>
+              <div class="folder-meta">ClipNote needs permission to access your previously selected screenshot folder.</div>
+            </div>
+          </div>
+          <div class="folder-actions">
+            <button id="btn-reconnect" class="btn btn-primary">Reconnect Folder</button>
+          </div>
+        </div>
+
+        <!-- UNAVAILABLE CARD -->
+        <div id="card-unavailable" class="folder-card error hidden">
+          <div class="folder-row">
+            <span class="folder-icon">&#9888;</span>
+            <div>
+              <div class="folder-name">Folder unavailable</div>
+              <div class="folder-meta">This browser does not support the File System Access API, or the folder is no longer accessible. Choose a folder to try again.</div>
+            </div>
+          </div>
+          <div class="folder-actions">
+            <button id="btn-choose2" class="btn btn-primary">Choose Folder</button>
+          </div>
+        </div>
+      </section>
+
+      <!-- ===== REBUILD BANNER (IndexedDB lost) ===== -->
+      <section id="rebuild-banner" class="storage-section rebuild-banner hidden">
+        <div class="rebuild-icon">&#9888;</div>
+        <div>
+          <div class="folder-name">Local database appears to be empty</div>
+          <div class="folder-meta">but your screenshot folder still contains ClipNote files. Rebuild the library to recover your moments from the files on disk.</div>
+        </div>
+        <div class="folder-actions">
+          <button id="btn-rebuild-banner" class="btn btn-primary">Rebuild Library</button>
+        </div>
+      </section>
+
+      <!-- ===== LIBRARY ===== -->
+      <section id="library-section" class="storage-section">
+        <h2 class="section-title">Local Library</h2>
+        <div class="stats-grid">
+          <div class="stat">
+            <div id="stat-screenshots" class="stat-value">0</div>
+            <div class="stat-label">Screenshots</div>
+          </div>
+          <div class="stat">
+            <div id="stat-moments" class="stat-value">0</div>
+            <div class="stat-label">Captured Moments</div>
+          </div>
+          <div class="stat">
+            <div id="stat-pending" class="stat-value">0</div>
+            <div class="stat-label">Not in Folder</div>
+          </div>
+        </div>
+
+        <div class="library-actions">
+          <button id="btn-scan" class="btn btn-ghost">Scan Folder</button>
+          <button id="btn-rebuild" class="btn btn-ghost">Rebuild Library</button>
+          <button id="btn-migrate" class="btn hidden">Move to Folder</button>
+        </div>
+        <div id="library-msg" class="line-msg hidden"></div>
+        <div id="scan-list" class="scan-list hidden"></div>
+      </section>
+
+      <div class="storage-footnote">
+        <p>Only the original screenshots live in the folder. Notes, timestamps, annotations, ordering and video metadata are also written into each note folder (<code>_clipnote-note.json</code>), so <b>Rebuild Library</b> restores not just the moments but their annotation, time and ordering from the files on disk even after you clear the browser data.</p>
+      </div>
+    </div>
+
+    <script type="module" src="storage.js"></script>
+  </body>
+</html>

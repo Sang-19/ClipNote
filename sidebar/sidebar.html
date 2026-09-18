@@ -1,0 +1,96 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>ClipNote Sidebar</title>
+    <link rel="stylesheet" href="sidebar.css" />
+  </head>
+  <body>
+    <div id="cn-root">
+      <!-- ===== HOME VIEW ===== -->
+      <div id="cn-view-home" class="cn-view">
+        <header class="cn-header">
+          <div class="cn-header-left">
+            <div class="cn-title">Notes</div>
+            <!--<div class="cn-subtitle">Your Notes</div>-->
+          </div>
+          <div class="cn-header-right">
+            <button id="cn-btn-feedback" class="cn-header-btn" title="Send Feedback">Feedback</button>
+            <button id="cn-btn-storage" class="cn-header-btn" title="Local Storage">Storage</button>
+          </div>
+        </header>
+
+        <div id="cn-shots-section" class="cn-shots-section cn-hidden">
+          <div class="cn-section-label">
+            <span>Screenshots</span>
+            <span id="cn-shot-count" class="cn-muted"></span>
+          </div>
+          <div id="cn-shot-list" class="cn-shots-list"></div>
+        </div>
+
+        <div id="cn-home-list" class="cn-home-list"></div>
+
+        <div id="cn-home-empty" class="cn-empty">
+          <div class="cn-empty-icon">&#x2726;</div>
+          <div class="cn-empty-text">No notes yet.</div>
+          <div class="cn-empty-sub">Open a YouTube or Udemy video and start capturing moments.</div>
+        </div>
+
+        <div class="cn-capture-bar">
+          <div class="cn-home-capture-row">
+            <button id="cn-home-new" class="cn-capture-btn">+ New Note</button>
+            <a id="cn-linkedin-link" class="cn-linkedin-link" href="https://www.linkedin.com/in/sangbed-pati-966aa228/" target="_blank" rel="noopener noreferrer" title="Visit my LinkedIn" aria-label="Visit my LinkedIn">
+              <svg viewBox="0 0 24 24" aria-hidden="true" focusable="false" fill="currentColor">
+                <path d="M20.45 20.45h-3.56v-5.57c0-1.33-.02-3.04-1.85-3.04-1.85 0-2.13 1.45-2.13 2.94v5.67H9.35V9h3.42v1.56h.05c.48-.9 1.64-1.85 3.37-1.85 3.6 0 4.27 2.37 4.27 5.46v6.28zM5.34 7.43a2.07 2.07 0 1 1 0-4.13 2.07 2.07 0 0 1 0 4.13zM7.12 20.45H3.56V9h3.56v11.45zM22.22 0H1.77C.79 0 0 .77 0 1.72v20.56C0 23.23.79 24 1.77 24h20.45c.98 0 1.78-.77 1.78-1.72V1.72C24 .77 23.2 0 22.22 0z"/>
+              </svg>
+            </a>
+          </div>
+        </div>
+      </div>
+
+      <!-- ===== ACTIVE NOTE VIEW ===== -->
+      <div id="cn-view-note" class="cn-view cn-hidden">
+        <header class="cn-header">
+          <div class="cn-header-left">
+            <button id="cn-note-back" class="cn-back-btn" title="Back to Home">&#x2190;</button>
+          </div>
+          <div class="cn-header-center">
+            <div id="cn-note-title-display" class="cn-note-title-display"></div>
+            <div id="cn-note-video-info" class="cn-muted cn-header-video-info"></div>
+          </div>
+          <div class="cn-header-right">
+            <button id="cn-btn-export" class="cn-header-btn" title="Export to PDF">Export</button>
+            <button id="cn-btn-new" class="cn-header-btn" title="New Note">New</button>
+          </div>
+        </header>
+
+        <div class="cn-section-label">
+          <span>Captured Moments</span>
+          <span id="cn-moment-count" class="cn-muted"></span>
+        </div>
+
+        <div id="cn-moments-list" class="cn-notes-list"></div>
+
+        <div id="cn-no-moments" class="cn-empty">
+          <div class="cn-empty-icon">&#x2726;</div>
+          <div class="cn-empty-text">No moments captured yet.</div>
+          <div class="cn-empty-sub">Capture an important moment from the video to save it here.</div>
+        </div>
+
+        <div class="cn-capture-bar">
+          <div class="cn-capture-row">
+            <button id="cn-btn-capture" class="cn-capture-btn">+ Capture</button>
+            <button id="cn-btn-shot" class="cn-capture-btn cn-shot-btn" title="Capture a rectangular screenshot of the page">Screenshot</button>
+          </div>
+        </div>
+
+        <div class="cn-footer">
+          <span id="cn-status" class="cn-muted"></span>
+        </div>
+      </div>
+    </div>
+
+    <script type="module" src="sidebar.js"></script>
+  </body>
+</html>
