@@ -1,0 +1,11 @@
+{
+  "name": "clipnote",
+  "private": true,
+  "version": "1.4.1",
+  "type": "module",
+  "description": "ClipNote - local Chrome extension tests (Node suites import local-storage.js pure functions)",
+  "scripts": {
+    "test": "node tests/clipnote-audit-fixes.test.mjs",
+    "syntaxcheck": "node --check local-storage.js"
+  }
+}

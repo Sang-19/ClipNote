@@ -8,6 +8,8 @@ const $ = (id) => document.getElementById(id);
 
 // The key the sidebar uses for its saved notes list.
 const NOTE_KEY = 'clipnote_notes';
+// The key the sidebar uses for its manual screenshots list.
+const SHOTS_KEY = 'clipnote_manual_shots';
 
 // Read the notes list shared with the sidebar (images are stripped there).
 async function loadNotes() {
@@ -25,6 +27,21 @@ async function saveNotes(notes) {
   // Write the list into Chrome's storage.
   return new Promise((resolve) => {
     chrome.storage.local.set({ [NOTE_KEY]: notes }, resolve);
+  });
+}
+
+// Read the manual screenshots list shared with the sidebar.
+async function loadManualShots() {
+  const res = await new Promise((resolve) => {
+    chrome.storage.local.get([SHOTS_KEY], (r) => resolve(r[SHOTS_KEY]));
+  });
+  return Array.isArray(res) ? res : [];
+}
+
+// Save the manual screenshots list back for the sidebar.
+async function saveManualShots(shots) {
+  return new Promise((resolve) => {
+    chrome.storage.local.set({ [SHOTS_KEY]: shots }, resolve);
   });
 }
 
@@ -79,7 +96,8 @@ async function render() {
   await renderStats();
 }
 
-// Update the screenshot / moment / pending counters.
+// Update the screenshot / moment / pending counters (plus the detailed
+// library diagnostics classifying every file and moment).
 async function renderStats() {
   // The notes shared with the sidebar.
   const notes = await loadNotes();
@@ -87,13 +105,35 @@ async function renderStats() {
   const moments = notes.reduce((n, note) => n + (note.moments || []).length, 0);
   // Moments with an inline screenshot not yet written to the folder.
   const pending = ls.countPendingToFolder(notes);
-  // Files actually sitting in the folder (may lag behind metadata).
-  const screenshots = await ls.countImageFiles();
+  // A detailed classification of the library against the files on disk.
+  const diag = await ls.analyzeLibrary(notes);
 
   // Paint the three stat cards.
-  $('stat-screenshots').textContent = String(screenshots);
+  $('stat-screenshots').textContent = String(diag.files.total);
   $('stat-moments').textContent = String(moments);
   $('stat-pending').textContent = String(pending);
+
+  // The diagnostics detail (a plain preformatted block, shown when there is
+  // anything worth looking at). Explains exactly where each file/moment sits.
+  const diagEl = $('diag-detail');
+  if (diagEl) {
+    const parts = [
+      `Screenshot files: ${diag.files.total} total`,
+      `  ${diag.files.matched} matched to a moment`,
+      `  ${diag.files.recoverable} recoverable (on disk, no matching moment)`,
+      `  ${diag.files.manual} manual screenshots`,
+      `  ${diag.files.duplicate} duplicates`,
+      `  ${diag.files.invalid} unparseable`,
+      `Moments: ${diag.moments.total} total`,
+      `  ${diag.moments.withFile} screenshot on disk`,
+      `  ${diag.moments.pending} screenshot only in browser (not written to the folder)`,
+      `  ${diag.moments.failed} failed folder writes`,
+      `  ${diag.moments.missingFile} recorded file missing on disk`,
+      `  ${diag.moments.textOnly} text-only (no screenshot)`
+    ];
+    diagEl.textContent = parts.join('\n');
+    diagEl.classList.toggle('hidden', notes.length === 0 && diag.files.total === 0);
+  }
 
   // Offer the migration action whenever there's something to write out.
   const migrateBtn = $('btn-migrate');
@@ -104,7 +144,7 @@ async function renderStats() {
   }
 
   // When the database is empty but files exist, highlight the rebuild path.
-  $('rebuild-banner').classList.toggle('hidden', !(notes.length === 0 && screenshots > 0));
+  $('rebuild-banner').classList.toggle('hidden', !(notes.length === 0 && diag.files.total > 0));
 }
 
 // Run the folder picker (or re-request permission) then repaint.
@@ -173,7 +213,8 @@ async function scanFolder() {
     : 'No screenshots found in the folder.', paths.length > 0 ? 'ok' : 'err');
 }
 
-// Stitch the files on disk back into the notes library.
+// Stitch the files on disk back into the notes library (and recover manual
+// screenshots from the shared on-disk index).
 async function rebuild() {
   // Start with the notes we already know about.
   const notes = await loadNotes();
@@ -181,14 +222,36 @@ async function rebuild() {
   const result = await ls.rebuildLibrary(notes);
   // Persist the recovered library.
   await saveNotes(result.notes);
+  // Merge the recovered manual screenshots with the stored list: per-install
+  // browser storage may keep shots the on-disk index lost (or vice versa), so
+  // union by id is the non-destructive cross-install merge.
+  const existingShots = await loadManualShots();
+  const mergedShots = [];
+  const seen = new Set();
+  for (const s of result.manualShots || []) {
+    if (!s || !s.id || seen.has(s.id)) continue;
+    seen.add(s.id);
+    mergedShots.push(s);
+  }
+  for (const s of existingShots || []) {
+    if (!s || !s.id || seen.has(s.id)) continue;
+    seen.add(s.id);
+    mergedShots.push(s);
+  }
+  // Persist the merged manual library back into browser storage AND mirror it
+  // into the shared filesystem index so both installs converge.
+  await saveManualShots(mergedShots);
+  await ls.saveManualShotsIndex(mergedShots);
   // Tell the user what happened.
   const parts = [];
   if (result.added > 0) parts.push(`${result.added} moment${result.added !== 1 ? 's' : ''} recovered`);
   if (result.createdNotes > 0) parts.push(`${result.createdNotes} note${result.createdNotes !== 1 ? 's' : ''} created`);
+  const manual = (result.manualShots || []).length;
+  if (manual > 0) parts.push(`${manual} manual screenshot${manual !== 1 ? 's' : ''} indexed`);
   // If nothing changed, explain that clearly.
   const summary = parts.length > 0 ? parts.join(', ') + '.' : 'Nothing new found. The library already matches the folder.';
   // Show the summary.
-  setMsg($('library-msg'), summary, result.added > 0 || result.createdNotes > 0 ? 'ok' : 'err');
+  setMsg($('library-msg'), summary, result.added > 0 || result.createdNotes > 0 || manual > 0 ? 'ok' : 'err');
   // Refresh all the counters.
   await render();
 }

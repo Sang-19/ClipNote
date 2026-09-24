@@ -15,7 +15,8 @@ const KEY_NAME = 'dir_name';
 
 // The metadata sidecar written into every per-note folder. It lets the
 // filesystem stand alone as a recovery source (stable note id + title + video/
-// course/lecture ids) even after the extension's browser-local storage is gone.
+// course/lecture ids + full moment metadata) even after the extension's
+// browser-local storage is gone.
 const SIDECAR_NAME = '_clipnote-note.json';
 
 // Root-level registry of files whose INTENTIONAL deletion failed but which must
@@ -23,6 +24,19 @@ const SIDECAR_NAME = '_clipnote-note.json';
 // could not actually remove an existing file (permission/transient error), so a
 // later rebuild cannot resurrect deleted content from the leftovers.
 const TOMBSTONE_NAME = '_clipnote-deleted.json';
+
+// Root-level index of independent manual webpage screenshots. Like the note
+// sidecars, it lives on the SHARED filesystem so the Web Store and local
+// installations can both discover the same manual screenshots even though
+// `clipnote_manual_shots` is per-extension browser storage.
+const MANUAL_INDEX_NAME = '_clipnote-manual.json';
+
+// The schema version stamped onto every note record saved to chrome.storage
+// and on the filesystem sidecars. Any missing/newer fields are optional by
+// contract: NEW FEATURE MISSING === OPTIONAL FIELD, never an invalid record.
+export const NOTE_SCHEMA_VERSION = 4;
+// The version written into _clipnote-note.json files.
+export const SIDECAR_VERSION = 4;
 
 // The internal database connection (null until opened).
 let idb = null;
@@ -218,11 +232,14 @@ function tsToName(seconds) {
 // is ALWAYS the note's own id, so two notes about the same video/lecture (and
 // two notes with different ids) can never share a folder, and a rename can
 // never move the note's screenshots.
-//   YouTube: YouTube/<videoId>/<noteId>
-//   Udemy:   Udemy/<courseId>/<lectureId>/<noteId>
+//   YouTube:  YouTube/<videoId>/<noteId>
+//   Udemy:    Udemy/<courseId>/<lectureId>/<noteId>
+//   ChatGPT:  ChatGPT/<conversationId>/<noteId>
 export function noteFolderRelativePath(note) {
   // The platform this note came from.
-  const platform = note && note.platform === 'udemy' ? 'Udemy' : 'YouTube';
+  let platform = 'YouTube';
+  if (note && note.platform === 'udemy') platform = 'Udemy';
+  else if (note && note.platform === 'chatgpt') platform = 'ChatGPT';
   // The stable note identity (uuid) that owns the folder.
   const noteId = safeSegment(note && note.id, 'note');
 
@@ -236,6 +253,16 @@ export function noteFolderRelativePath(note) {
     const lecture = safeSegment((note.lecture && note.lecture.id) || (note.video && note.video.id), 'lecture');
     // e.g. Udemy/123456/789101/<noteId>
     return `Udemy/${course}/${lecture}/${noteId}`;
+  }
+
+  // ChatGPT notes nest one level under the conversation id, exactly like the
+  // video-level nesting below.
+  if (platform === 'ChatGPT') {
+    const conversationId = safeSegment(
+      (note.video && note.video.id) || (note.conversation && note.conversation.id),
+      'conversation');
+    // e.g. ChatGPT/1ab2cd3e-<conversationId>/<noteId>
+    return `${platform}/${conversationId}/${noteId}`;
   }
 
   // YouTube notes nest one level under the video id. The video id is the only
@@ -540,18 +567,6 @@ export async function deleteScreenshotFile(relativePath, context) {
   }
 }
 
-// Release a single cached preview URL (call this before removing its file).
-export function revokeBlobUrl(relativePath) {
-  // Look the cached URL up.
-  const url = blobUrlCache.get(relativePath);
-  // Nothing cached means there is nothing to revoke.
-  if (!url) return;
-  // Drop the entry.
-  blobUrlCache.delete(relativePath);
-  // Release the underlying object URL.
-  try { URL.revokeObjectURL(url); } catch (e) { /* ignore */ }
-}
-
 // Resolve a stored relative path down to the directory it lives in.
 // Returns { dir, fileName } or null when the path cannot be reached.
 async function resolveDirHandle(relativePath) {
@@ -805,32 +820,98 @@ export async function deleteNoteFilesystem(note) {
 
 // ----------------------- Preview reading -----------------------
 
-// Keep one object URL per file so repeated renders don't leak.
+// Object URL registry keyed by relative path. Entries are ONLY revoked when
+// the path stops being referenced by the live UI (sweepBlobUrls) or on a real
+// teardown (revokeAllBlobUrls) - never opportunistically while an image still
+// points at the URL. A stale URL (from an earlier sesson, a different note, or
+// a re-render) is simply regenerated on demand, so every file that exists on
+// disk always has a working preview. The same promise drives fallback: the
+// renderer re-reads from the path whenever the in-memory URL is missing.
 const blobUrlCache = new Map();
-// Never let the cache grow past this size: the oldest entry is revoked and
-// dropped, so previews keep working while the cache stays bounded even across
-// many videos/notes inside the (long-lived) sidebar iframe.
-const MAX_BLOB_URL_CACHE = 50;
+// Paths currently referenced by live <img>/preview elements. sweepBlobUrls()
+// only revokes URLs whose path is NOT in this set, so a visible screenshot
+// can never be torn out from under its element.
+const blobUrlInUse = new Set();
+// Hard safety ceiling for the registry. In normal use the sweep keeps the
+// registry near the number of VISIBLE thumbnails; this is only a last-resort
+// cap in case a referencing bug ever marks far too many paths "in use".
+const MAX_BLOB_URL_LIVE = 400;
 
-// Release every cached object URL. Called when the consuming sidebar context
-// is torn down (the sidebar iframe usually lives for the whole tab, so this is
-// the guaranteed-cleanup point).
+// True when the given path has a live object URL right now.
+export function hasBlobUrl(relativePath) {
+  return blobUrlCache.has(relativePath);
+}
+
+// Return the current cached URL without creating one (null when absent).
+export function safeGetBlobUrl(relativePath) {
+  return blobUrlCache.get(relativePath) || null;
+}
+
+// Mark the set of relative paths that the UI currently renders. The calling
+// page calls this immediately before every render pass, then sweepBlobUrls().
+export function markBlobUrlsInUse(relativePaths) {
+  blobUrlInUse.clear();
+  for (const p of relativePaths || []) {
+    if (p) blobUrlInUse.add(p);
+  }
+}
+
+// Revoke every cached object URL whose path is no longer rendered, so memory
+// stays bounded while every visible screenshot keeps working.
+export function sweepBlobUrls() {
+  for (const [path, url] of blobUrlCache) {
+    // Skip paths that are still on screen.
+    if (blobUrlInUse.has(path)) continue;
+    blobUrlCache.delete(path);
+    try { URL.revokeObjectURL(url); } catch (e) { /* ignore */ }
+  }
+  // Last-resort ceiling: if a bug keeps too many paths "in use", drop the
+  // oldest NOT-visible entries first (visible ones always survive).
+  if (blobUrlCache.size > MAX_BLOB_URL_LIVE) {
+    for (const [path, url] of blobUrlCache) {
+      if (blobUrlCache.size <= MAX_BLOB_URL_LIVE) break;
+      // Never touch a URL a live element may be pointing at.
+      if (blobUrlInUse.has(path)) continue;
+      blobUrlCache.delete(path);
+      try { URL.revokeObjectURL(url); } catch (e) { /* ignore */ }
+    }
+  }
+}
+
+// Release every cached object URL. Called ONLY on a genuine teardown of the
+// consuming context (the sidebar iframe usually lives for the whole tab, so
+// this is the guaranteed-cleanup point). bfcache restores must NOT call this -
+// the pagehide handler checks e.persisted before reaching it.
 export function revokeAllBlobUrls() {
   for (const url of blobUrlCache.values()) {
     try { URL.revokeObjectURL(url); } catch (e) { /* ignore */ }
   }
   blobUrlCache.clear();
+  blobUrlInUse.clear();
+}
+
+// Drop the cached object URL for one path (used when the file is going away).
+export function revokeBlobUrl(relativePath) {
+  blobUrlInUse.delete(relativePath);
+  const url = blobUrlCache.get(relativePath);
+  if (!url) return;
+  blobUrlCache.delete(relativePath);
+  try { URL.revokeObjectURL(url); } catch (e) { /* ignore */ }
+}
+
+// Test-only hook: seed the preview registry without a filesystem, so the Node
+// suite can exercise the sweep/revoke invariants in isolation.
+export function debugSeedBlobUrl(relativePath, url) {
+  blobUrlCache.set(relativePath, url);
 }
 
 // Return a displayable object URL for a stored screenshot file (or null).
+// Note: this never revokes anything. Stale/generated-on-demand URLs are cheap;
+// revocation only happens through sweepBlobUrls/revokeAllBlobUrls/revokeBlobUrl.
 export async function readBlobUrl(relativePath) {
   // Return the cached URL when we already made one this session.
   if (blobUrlCache.has(relativePath)) {
-    // Refresh recency so hot paths are not the first ones evicted.
-    const url = blobUrlCache.get(relativePath);
-    blobUrlCache.delete(relativePath);
-    blobUrlCache.set(relativePath, url);
-    return url;
+    return blobUrlCache.get(relativePath);
   }
   // Guard against errors.
   try {
@@ -857,13 +938,6 @@ export async function readBlobUrl(relativePath) {
     const url = URL.createObjectURL(file);
     // Remember it for the rest of this session.
     blobUrlCache.set(relativePath, url);
-    // Enforce the bound: drop the least-recently-used entry first.
-    while (blobUrlCache.size > MAX_BLOB_URL_CACHE) {
-      const oldestKey = blobUrlCache.keys().next().value;
-      const oldestUrl = blobUrlCache.get(oldestKey);
-      blobUrlCache.delete(oldestKey);
-      try { URL.revokeObjectURL(oldestUrl); } catch (e) { /* ignore */ }
-    }
     return url;
   } catch (e) {
     // Any failure means no preview is available.
@@ -924,6 +998,46 @@ export async function countImageFiles() {
   return (await listImagePaths()).length;
 }
 
+// Capture the scan: relative paths plus each file's last-modified time in ms.
+// Rebuild uses these mt instead of Date.now() so the recovered timestamps are
+// deterministic across installs and reruns.
+export async function listImageStats() {
+  // Guard against errors.
+  try {
+    // Make sure we have a folder.
+    const entry = await getFolderEntry();
+    // Without a handle there are no files.
+    if (!entry.handle) return [];
+    // Collect { relativePath, lastModified } records.
+    const out = [];
+    const walk = async (dirHandle, prefix) => {
+      for await (const [name, child] of dirHandle.entries()) {
+        if (child.kind === 'directory') {
+          // Recurse with the extended prefix.
+          await walk(child, prefix ? `${prefix}/${name}` : name);
+        } else if (isImageName(name)) {
+          // The relative path of this image.
+          const rel = prefix ? `${prefix}/${name}` : name;
+          // Best-effort mtime (a missing read falls back to 0).
+          let lastModified = 0;
+          try {
+            const file = await child.getFile();
+            lastModified = file.lastModified || 0;
+          } catch (e) { /* keep 0 */ }
+          out.push({ relativePath: rel, lastModified });
+        }
+      }
+    };
+    await walk(entry.handle, '');
+    // Drop tombstoned paths, then sort for a stable list.
+    const tombstoned = await readTombstones();
+    return out.filter((s) => s && !tombstoned.has(s.relativePath)).sort((a, b) => (a.relativePath < b.relativePath ? -1 : 1));
+  } catch (e) {
+    // A scan must never crash the UI.
+    return [];
+  }
+}
+
 // Reverse a relative path + filename back into structured metadata.
 // Understands BOTH the legacy (v1) and current (v2) layouts:
 //   v1 YouTube: YouTube/<videoId>/MM-SS_<momentId>.jpg
@@ -931,6 +1045,17 @@ export async function countImageFiles() {
 //   v1 Udemy:   Udemy/<courseId>/<lectureId>/MM-SS_<momentId>.jpg
 //   v2 Udemy:   Udemy/<courseId>/<lectureId>/<noteId>/MM-SS_<momentId>.jpg
 //   manual:     Screenshots/<Platform>/yyyy-MM-dd_HH-mm-ss_<id>.jpg
+//   ChatGPT:    ChatGPT/<conversationId>/<noteId>/H-MM_<momentId>.jpg  (clock time)
+
+// The platform the top-level folder segment stands for: YouTube, Udemy or
+// ChatGPT. Unknown folders fall back to "youtube" (the legacy default).
+function topLevelPlatform(segment) {
+  const s = (segment || '').toLowerCase();
+  if (s === 'udemy') return 'udemy';
+  if (s === 'chatgpt') return 'chatgpt';
+  return 'youtube';
+}
+
 export function parseRelativePath(relativePath) {
   // Split the relative path into its segments.
   const parts = relativePath.split('/');
@@ -947,12 +1072,17 @@ export function parseRelativePath(relativePath) {
     // The file name itself.
     fileName: file,
     // The platform from the top-level folder.
-    platform: (parts[0] || '').toLowerCase() === 'udemy' ? 'udemy' : 'youtube',
+    platform: topLevelPlatform(parts[0]),
     // The moment id when the filename follows our pattern.
     momentId: (match && match[3]) || '',
-    // The timestamp in seconds when we can read it.
-    timestamp: match ? (parseInt(match[1], 10) * 60 + parseInt(match[2], 10)) : null,
-    // The seconds count in filename form.
+    // The timestamp in seconds when we can read it. ChatGPT file names use the
+    // WALL CLOCK ("14-31_<momentId>.jpg"), never a video position, so a real
+    // video timestamp is NEVER derived for it - it stays 0, exactly like the
+    // moment it was saved from.
+    timestamp: (topLevelPlatform(parts[0]) !== 'chatgpt' && match)
+      ? (parseInt(match[1], 10) * 60 + parseInt(match[2], 10))
+      : 0,
+    // The seconds count in filename form (a clock time for ChatGPT).
     humanTime: match ? `${match[1]}:${match[2]}` : '',
     // The owning note id when this is a v2 per-note folder.
     noteId: '',
@@ -964,7 +1094,7 @@ export function parseRelativePath(relativePath) {
   if ((parts[0] || '').toLowerCase() === 'screenshots') {
     // The platform from the second segment.
     derived.manualShot = true;
-    derived.platform = (parts[1] || '').toLowerCase() === 'udemy' ? 'udemy' : 'youtube';
+    derived.platform = topLevelPlatform(parts[1]);
     derived.videoId = '';
     derived.courseId = '';
     derived.lectureId = '';
@@ -981,6 +1111,14 @@ export function parseRelativePath(relativePath) {
     if (parts.length >= 4) {
       derived.noteId = parts[3] || '';
     }
+  } else if (derived.platform === 'chatgpt') {
+    // ChatGPT keeps one conversation-id folder and one note folder.
+    derived.videoId = parts[1] || '';
+    if (parts.length >= 3) {
+      derived.noteId = parts[2] || '';
+    }
+    derived.courseId = '';
+    derived.lectureId = '';
   } else {
     // YouTube keeps one video id folder and, in v2, one note folder.
     derived.videoId = parts[1] || '';
@@ -1026,10 +1164,134 @@ function sameVideo(a, b) {
   return !!ia.video && !!ib.video && ia.video === ib.video;
 }
 
+// ----------------------- Normalization / schema -----------------------
+//
+// Every note carries `schemaVersion`. Interpreting fields:
+//   - A field ABSENT from an older record is an OPTIONAL field (documented
+//     default), never an invalid record (backward compatibility contract).
+//   - NORMALIZE is additive and idempotent: it fills defaults but never deletes
+//     or reorders anything, and running it twice is a no-op.
+//   - Moment identity is DETERMINISTIC before it ever falls back to a uuid: the
+//     filename's embedded moment id, else the filename base, else noteId+index.
+//     No moment is ever dropped for lacking a string id.
+//   - ChatGPT moments keep timestamp 0 and their wall-clock humanTime; a fake
+//     video timestamp is never invented for them.
+
+// Turn seconds into an "MM:SS" clock label (display only - filenames use "-").
+function formatSeconds(seconds) {
+  seconds = Math.max(0, Math.floor(seconds || 0));
+  const m = Math.floor(seconds / 60);
+  const s = seconds % 60;
+  return `${String(m).padStart(2, '0')}:${String(s).padStart(2, '0')}`;
+}
+
+// Determine a moment's identity deterministically (Fix: a missing/invalid `id`
+// can no longer cause the moment to be dropped).
+function deriveMomentId(raw, note, index) {
+  // The stored id wins when it is a usable string.
+  if (raw && typeof raw.id === 'string' && raw.id) return raw.id;
+  // A filename-derived id (MM-SS_<id>: the id after the underscore).
+  const rel = (raw && raw.relativePath) || (raw && raw.imageFileName) || '';
+  if (rel) {
+    const base = rel.split('/').pop().replace(/\.[^.]+$/, '');
+    const m = base.match(/^(\d+)-(\d{2})_(.+)$/) || base.match(/^H-(\d+)-(\d{2})_(.+)$/);
+    if (m && m[3]) return m[3];
+    if (base) return base;
+  }
+  // noteId + position is stable for the stored array.
+  if (note && note.id) return `${note.id}::moment-${Math.max(0, index || 0)}`;
+  // Absolute last resort (a fresh moment): a uuid keeps it unique.
+  return `moment-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
+}
+
+// Normalize a single moment into the canonical shape. Never drops the moment.
+// The screenshot field (data/blob/remote URLs) is passed through untouched -
+// normalization only fills the METADATA the renderer and checker depend on.
+export function normalizeMoment(raw, index, note) {
+  // Non-object garbage is dropped.
+  if (!raw || typeof raw !== 'object') return null;
+  const chat = !!note && note.platform === 'chatgpt';
+  // ChatGPT moments have NO video position: 0, never invented.
+  const ts = (typeof raw.timestamp === 'number' && Number.isFinite(raw.timestamp) && raw.timestamp >= 0)
+    ? raw.timestamp
+    : 0;
+  const id = deriveMomentId(raw, note, index);
+  // Wall-clock for ChatGPT, derived video time otherwise.
+  const humanTime = (typeof raw.humanTime === 'string' && raw.humanTime)
+    ? raw.humanTime
+    : (chat ? '' : formatSeconds(ts));
+  const rel = (typeof raw.relativePath === 'string') ? raw.relativePath : '';
+  const createdAt = (typeof raw.createdAt === 'number' && Number.isFinite(raw.createdAt)) ? raw.createdAt : Date.now();
+  const updatedAt = (typeof raw.updatedAt === 'number' && Number.isFinite(raw.updatedAt)) ? raw.updatedAt : createdAt;
+  return {
+    ...raw,
+    // Canonical metadata (stable defaults, never destructive).
+    id,
+    timestamp: ts,
+    humanTime,
+    annotation: (typeof raw.annotation === 'string') ? raw.annotation : '',
+    platform: (typeof raw.platform === 'string') ? raw.platform : (note ? note.platform || '' : ''),
+    videoId: (typeof raw.videoId === 'string') ? raw.videoId : '',
+    videoUrl: (typeof raw.videoUrl === 'string') ? raw.videoUrl : '',
+    relativePath: rel,
+    imageFileName: (typeof raw.imageFileName === 'string') ? raw.imageFileName : '',
+    sortOrder: (typeof raw.sortOrder === 'number' && Number.isFinite(raw.sortOrder)) ? raw.sortOrder : (index || 0),
+    saveState: (typeof raw.saveState === 'string') ? raw.saveState : '',
+    createdAt,
+    updatedAt,
+    // Keep whatever screenshot reference the record carried (optional by contract).
+    screenshot: raw.screenshot || undefined
+  };
+}
+
+// Normalize a note into the canonical shape (schema version 4). Fill-in only:
+// missing fields get documented defaults, present fields are never altered, and
+// no moment or note is ever removed because a field is absent or malformed.
+export function normalizeNote(raw, index) {
+  // Non-object garbage is dropped.
+  if (!raw || typeof raw !== 'object') return null;
+  // A newer schema must never be downgraded by this app's normalization.
+  if (typeof raw.schemaVersion === 'number' && raw.schemaVersion > NOTE_SCHEMA_VERSION) return raw;
+  const id = (typeof raw.id === 'string' && raw.id) ? raw.id : `note-${Math.max(0, index || 0)}-${(raw.video && raw.video.id) || raw.courseId || 'x'}`;
+  const platform = ['youtube', 'udemy', 'chatgpt'].includes(raw.platform)
+    ? raw.platform
+    : (raw.course ? 'udemy' : 'youtube');
+  const moments = (Array.isArray(raw.moments) ? raw.moments : [])
+    .map((m, i) => normalizeMoment(m, i, { ...raw, id, platform }))
+    .filter(Boolean);
+  const createdAt = (typeof raw.createdAt === 'number' && Number.isFinite(raw.createdAt)) ? raw.createdAt : Date.now();
+  const updatedAt = (typeof raw.updatedAt === 'number' && Number.isFinite(raw.updatedAt)) ? raw.updatedAt : createdAt;
+  return {
+    ...raw,
+    schemaVersion: NOTE_SCHEMA_VERSION,
+    id,
+    title: (typeof raw.title === 'string' && raw.title.trim()) ? raw.title : 'Untitled',
+    platform,
+    moments,
+    createdAt,
+    updatedAt,
+    video: raw.video && typeof raw.video === 'object'
+      ? { id: raw.video.id || raw.videoId || '', title: raw.video.title || '', url: raw.video.url || raw.videoUrl || '' }
+      : { id: raw.videoId || '', title: '', url: raw.videoUrl || '' }
+  };
+}
+
+// Normalize an array of notes (idempotent, non-destructive).
+export function normalizeNotes(notes) {
+  return (Array.isArray(notes) ? notes : [])
+    .map((n, i) => normalizeNote(n, i))
+    .filter(Boolean);
+}
+
 // Rebuild a note object from a scanned file (plus optional folder sidecar).
-function buildPlaceholderNote(first, sidecar, key) {
+// `mtimes` (when given) is the group's { min, max } file modified times in ms,
+// used INSTEAD OF Date.now() so a rebuilt note's timestamps are deterministic
+// (Fix: a Rebuild on two installs produces identical createdAt/updatedAt).
+function buildPlaceholderNote(first, sidecar, key, mtimes) {
   // The video-level label used only when the title is genuinely unavailable.
-  const label = first.platform === 'udemy' ? (first.courseId || 'course') : (first.videoId || 'video');
+  let label = first.videoId || 'video';
+  if (first.platform === 'udemy') label = first.courseId || 'course';
+  else if (first.platform === 'chatgpt') label = first.videoId || 'conversation';
   // Keep the SAME note id the file already carries (v2). Only legacy v1 files
   // have no note id, so they get a deterministic "recovered-<key>" id instead.
   const id = first.noteId || `recovered-${key.replace(/[^a-zA-Z0-9]/g, '-')}`;
@@ -1041,8 +1303,15 @@ function buildPlaceholderNote(first, sidecar, key) {
     // v2 without a sidecar: the note id is known but no title survived.
     title = `Recovered ${first.noteId}`;
   }
+  // Deterministic creation/last-change: the sidecar values win (they were
+  // persisted metadata), otherwise the earliest/latest file mtime in the note's
+  // folder. NO Date.now() anywhere on this path.
+  const createdAt = (sidecar && sidecar.createdAt) || (mtimes && mtimes.min) || first.createdAt || 0;
+  const updatedAt = (sidecar && sidecar.updatedAt) || (mtimes && mtimes.max) || createdAt || first.updatedAt || 0;
   // The recovered note.
   const note = {
+    // The canonical schema version (format/schema contract).
+    schemaVersion: NOTE_SCHEMA_VERSION,
     // The stable note id restored from the path (or the deterministic legacy id).
     id,
     // Its display title.
@@ -1055,15 +1324,17 @@ function buildPlaceholderNote(first, sidecar, key) {
       id: first.videoId,
       // The title (only known when a sidecar survived).
       title: (sidecar && sidecar.video && typeof sidecar.video.title === 'string') ? sidecar.video.title : '',
-      // Unknown url.
-      url: ''
+      // The url (only known when a sidecar survived).
+      url: (sidecar && sidecar.video && typeof sidecar.video.url === 'string') ? sidecar.video.url : ''
     },
+    // The top-level platform identity for ChatGPT recovery.
+    conversationId: first.videoId || (sidecar && sidecar.conversationId) || '',
     // No moments yet (we add them below).
     moments: [],
-    // When it was created (only known when a sidecar survived).
-    createdAt: (sidecar && sidecar.createdAt) || Date.now(),
+    // When it was created.
+    createdAt,
     // When it was last changed.
-    updatedAt: (sidecar && sidecar.updatedAt) || Date.now()
+    updatedAt
   };
   // Udemy placeholders also carry course and lecture ids (from the path and,
   // where available, the sidecar) so future recovery and matching keep working.
@@ -1087,7 +1358,9 @@ function buildPlaceholderNote(first, sidecar, key) {
 // Merge parsed files (and optional sidecar metadata) into a notes library.
 // Pure function: it never touches chrome.storage, IndexedDB, or the filesystem,
 // so its rules stay deterministic and it can be exercised in isolation.
-export function mergeScannedFiles(parsedFiles, sidecars, existingNotes) {
+// `mtimes` (optional) maps a relative path to its file modification time; every
+// recovered moment/note derives createdAt/updatedAt from it instead of Date.now().
+export function mergeScannedFiles(parsedFiles, sidecars, existingNotes, mtimes) {
   // The list of notes we end up with.
   const notes = Array.isArray(existingNotes) ? existingNotes.map((n) => ({ ...n, moments: [...(n.moments || [])] })) : [];
   // How many moments were freshly recovered.
@@ -1120,6 +1393,20 @@ export function mergeScannedFiles(parsedFiles, sidecars, existingNotes) {
   for (const [key, group] of groups) {
     // The first file tells us the note/video identity.
     const first = group[0];
+    // The deterministic time range of the note's files on disk (used instead of
+    // Date.now() for recovered notes and moments).
+    let minM = Infinity;
+    let maxM = 0;
+    if (mtimes) {
+      for (const f of group) {
+        const t = mtimes.get(f.relativePath) || 0;
+        if (t) {
+          if (t < minM) minM = t;
+          if (t > maxM) maxM = t;
+        }
+      }
+    }
+    const noteRange = { min: minM === Infinity ? 0 : minM, max: maxM || 0 };
 
     // Find the note this group belongs to. v2 groups carry an exact note id in
     // the path, so they match ONLY that id (never a same-video fallback: two
@@ -1139,7 +1426,7 @@ export function mergeScannedFiles(parsedFiles, sidecars, existingNotes) {
         // AMBIGUOUS: never glue v1 leftovers onto an arbitrary note. Future
         // v2 rebuilds could bounce them around; instead they get their own
         // explicit "Recovered" bucket with a stable key, reported to the user.
-        const candidate = buildPlaceholderNote(first, null, key);
+        const candidate = buildPlaceholderNote(first, null, key, noteRange);
         // The bucket id is deterministic from the grouping key, so a bucket
         // created by an EARLIER scan is reused rather than re-created (a rerun
         // of merge/rebuild must stay idempotent).
@@ -1161,7 +1448,7 @@ export function mergeScannedFiles(parsedFiles, sidecars, existingNotes) {
       // The sidecar metadata for this note id (when it exists on disk).
       const sidecar = (sidecars && sidecars.get(first.noteId)) || null;
       // Reconstruct the note (v2 keeps its id; only legacy gets a placeholder).
-      note = buildPlaceholderNote(first, sidecar, key);
+      note = buildPlaceholderNote(first, sidecar, key, noteRange);
       // Count it as a created note.
       notes.push(note);
       byId.set(note.id, note);
@@ -1179,6 +1466,12 @@ export function mergeScannedFiles(parsedFiles, sidecars, existingNotes) {
       const meta = (sidecar && Array.isArray(sidecar.moments))
         ? sidecar.moments.find((m) => m && m.id === f.momentId)
         : null;
+      // The file's own modified time (deterministic recovery timestamps).
+      const fileMtime = (mtimes && mtimes.get(f.relativePath)) || noteRange.max || 0;
+      // When it was captured (deterministic: sidecar, else the file's mtime).
+      const createdAt = (meta && meta.createdAt) || fileMtime || 0;
+      // When it was last changed.
+      const updatedAt = (meta && meta.updatedAt) || fileMtime || createdAt;
       // Rebuild the moment from the file metadata.
       note.moments.push({
         // The moment's unique id (from the file name).
@@ -1206,10 +1499,10 @@ export function mergeScannedFiles(parsedFiles, sidecars, existingNotes) {
         // shuffle them ahead.
         sortOrder: (meta && Number.isFinite(meta.sortOrder)) ? meta.sortOrder : undefined,
         // When it was captured.
-        createdAt: (meta && meta.createdAt) || Date.now(),
+        createdAt,
         // When it was last changed.
-        updatedAt: (meta && meta.updatedAt) || Date.now(),
-        // The file is already on disk, so it counts as saved.
+        updatedAt,
+        // Whether the screenshot is genuinely on disk.
         saveState: 'saved'
       });
       // Count the recovery.
@@ -1242,25 +1535,36 @@ export function mergeScannedFiles(parsedFiles, sidecars, existingNotes) {
 // v2 per-note folders, the legacy v1 shared folders, and the manual page
 // screenshot folder. Reads the `_clipnote-note.json` sidecars so titles, video
 // ids and course/lecture metadata can be restored from the filesystem alone.
+// Also recovers independent manual screenshots (root `_clipnote-manual.json`
+// index + any Screenshots/ files) so BOTH installs share the same library.
 export async function rebuildLibrary(existingNotes) {
-  // Pull every image path in the folder.
-  const paths = await listImagePaths();
+  // Pull every image path + its modified time (deterministic recovered dates).
+  const stats = await listImageStats();
+  const paths = stats.map((s) => s.relativePath);
+  const mtimes = new Map(stats.map((s) => [s.relativePath, s.lastModified]));
   // Parse each path into structured metadata.
   const files = paths.map(parseRelativePath);
   // Any note metadata sidecars found on disk.
   const sidecars = await listNoteSidecars();
-  // Run the pure merge (existing notes win on title/id).
-  return mergeScannedFiles(files, sidecars, existingNotes);
+  // Run the pure merge (existing notes win on title/id/time), then stamp the
+  // canonical schema version on the result (normalization is idempotent).
+  const merged = mergeScannedFiles(files, sidecars, existingNotes, mtimes);
+  const notes = normalizeNotes(merged.notes);
+  // Recover manual webpage screenshots too (legacy browser storage + on-disk
+  // index + any files the index lost).
+  const manualShots = await recoverManualShots();
+  return { notes, added: merged.added, createdNotes: merged.createdNotes, manualShots };
 }
 
 // Persist a small metadata file (sidecar) into the note's own folder so the
 // filesystem can stand alone as a recovery source. Best-effort: a failure here
 // must never block a capture, an annotation save, or a rename.
 //
-// v3 expands the sidecar beyond the v2 (title/video/course/lecture only)
-// subset: it now also carries the full moment metadata (timestamps, annotation,
-// ordering, file references) WITHOUT any screenshot image data, so an annotation
-// or a reorder survives a storage wipe too. v2 sidecars remain fully readable.
+// v4 expands the v3 sidecar (which already carried the full moment metadata -
+// timestamps, annotation, ordering, file references - WITHOUT any screenshot
+// image data) with the canonical schema version and the video URL, so a rebuild
+// restores titles, ordering, annotations AND clickable video links from disk
+// alone. v1/v2/v3 sidecars remain fully readable.
 export async function saveNoteSidecar(note) {
   // A note id is required for the mapping to be deterministic.
   if (!note || !note.id) return false;
@@ -1271,13 +1575,15 @@ export async function saveNoteSidecar(note) {
   // The stable identity + human metadata to preserve on disk.
   const data = {
     format: 'clipnote-note',
-    version: 3,
+    version: SIDECAR_VERSION,
+    // The canonical schema version (the in-browser note records share it).
+    schemaVersion: NOTE_SCHEMA_VERSION,
     noteId: note.id,
     title: typeof note.title === 'string' ? note.title : '',
     platform: note.platform || (note.course ? 'udemy' : 'youtube'),
     createdAt: note.createdAt || Date.now(),
     updatedAt: note.updatedAt || Date.now(),
-    video: note.video ? { id: note.video.id || '', title: note.video.title || '' } : null,
+    video: note.video ? { id: note.video.id || '', title: note.video.title || '', url: note.video.url || '' } : null,
     course: note.course ? { id: note.course.id || '', slug: note.course.slug || '', title: note.course.title || '' } : null,
     lecture: note.lecture ? { id: note.lecture.id || '', title: note.lecture.title || '' } : null,
     // Every moment, minus its screenshot blob, mapped back to its file version.
@@ -1367,6 +1673,203 @@ export async function listNoteSidecars() {
     // A scan must never crash the UI.
     return new Map();
   }
+}
+
+// ----------------------- Manual screenshot index -----------------------
+//
+// Independent manual webpage screenshots live under `Screenshots/<Platform>/…`
+// on the SHARED filesystem. Because `clipnote_manual_shots` is per-extension
+// browser storage, the Web Store and local installations would otherwise never
+// discover each other's metadata. The root-level `_clipnote-manual.json` index
+// is that shared bridge: it is written whenever the shots change and read
+// during storage rebuilds so both installs recover the same manual library.
+
+// Write the root manual-shots index (best-effort; never blocks the UI).
+export async function saveManualShotsIndex(shots) {
+  // Make sure we have a usable folder with write access.
+  const entry = await getFolderEntry();
+  // Nothing to write when the folder is missing or unreachable.
+  if (!entry.handle || entry.permission !== 'granted') return false;
+  // The index data: every shot minus its inline screenshot blob.
+  const data = {
+    format: 'clipnote-manual',
+    version: 1,
+    shots: (Array.isArray(shots) ? shots : [])
+      .filter((s) => s && s.id)
+      .map((s) => {
+        const { screenshot, ...rest } = s;
+        return rest;
+      })
+  };
+  // Guard against filesystem failures.
+  try {
+    // The index file lives at the root of the chosen folder.
+    const fileHandle = await getFileHandleByPath(entry.handle, MANUAL_INDEX_NAME);
+    // Open a writeable stream.
+    const writable = await fileHandle.createWritable();
+    // Write the compact JSON.
+    await writable.write(JSON.stringify(data));
+    // Flush it to disk.
+    await writable.close();
+    // It worked.
+    return true;
+  } catch (e) {
+    // Never let the index write take a shot action down with it.
+    return false;
+  }
+}
+
+// Read the root manual-shots index (array of shot metadata, or []).
+export async function readManualShotsIndex() {
+  // Guard against errors.
+  try {
+    // Make sure we have a folder.
+    const entry = await getFolderEntry();
+    // Without a handle there is nothing to read.
+    if (!entry.handle) return [];
+    // The index file at the root of the chosen folder.
+    const fileHandle = await getFileHandleByPath(entry.handle, MANUAL_INDEX_NAME);
+    // The File object for it.
+    const file = await fileHandle.getFile();
+    // Its JSON text.
+    const data = JSON.parse(await file.text());
+    // Only keep valid entries.
+    if (!data || !Array.isArray(data.shots)) return [];
+    return data.shots.filter((s) => s && typeof s.id === 'string' && s.id);
+  } catch (e) {
+    // A missing/unreadable index just means "nothing indexed yet".
+    return [];
+  }
+}
+
+// Recover the manual screenshot library from the filesystem: the on-disk index
+// first (richest metadata), then any Screenshots/ files the index lost (e.g.
+// written by an older version or an import). Always returns a flat array of
+// shot metadata keyed by id (latest wins per id).
+export async function recoverManualShots() {
+  // Start from the on-disk index (the cross-install source of truth).
+  const indexed = await readManualShotsIndex();
+  const byId = new Map(indexed.map((s) => [s.id, s]));
+  // Scan the Screenshots/ folder for files not represented in the index yet.
+  const paths = await listImagePaths();
+  for (const p of paths) {
+    // Only the manual top-level folder interests us here.
+    if ((p.split('/')[0] || '').toLowerCase() !== 'screenshots') continue;
+    // Parse the manual file layout.
+    const f = parseRelativePath(p);
+    if (!f.manualShot) continue;
+    // A manual file has no stable moment id: derive one from the file name.
+    const parsedId = f.momentId || p.split('/').pop().replace(/\.[^.]+$/, '');
+    // Preserve an existing index entry (metadata wins); otherwise build one.
+    if (byId.has(parsedId)) continue;
+    // Build a minimal recovery entry from the filename/time.
+    const m = p.split('/').pop().match(/^(\d{4})-(\d{2})-(\d{2})_(\d{2})-(\d{2})-(\d{2})_/);
+    let createdAt = 0;
+    if (m) createdAt = Date.UTC(+m[1], +m[2] - 1, +m[3], +m[4], +m[5], +m[6]);
+    byId.set(parsedId, {
+      id: parsedId,
+      platform: f.platform || 'youtube',
+      title: '',
+      description: '',
+      url: '',
+      createdAt: createdAt || (f.createTime || 0),
+      imageFileName: f.fileName,
+      relativePath: f.relativePath,
+      saveState: 'saved',
+      recovered: true
+    });
+  }
+  // Deterministic order (newest first), as a plain array.
+  return Array.from(byId.values()).sort((a, b) => (b.createdAt || 0) - (a.createdAt || 0));
+}
+
+// ----------------------- Library diagnostics -----------------------
+
+// Classify every scanned path and every moment into actionable categories.
+// Pure function: `paths` is the parsed file list and `notes` any notes library.
+// It lets the Storage page (and tests) explain exactly where a screenshot file
+// lives, is missing, or was never saved.
+export function classifyLibrary(parsedFiles, notes) {
+  // ---- Files ----
+  const files = { total: 0, matched: 0, recoverable: 0, orphan: 0, duplicate: 0, invalid: 0, manual: 0 };
+  // ---- Moments ----
+  const moments = { total: 0, withFile: 0, textOnly: 0, missingFile: 0, pending: 0, failed: 0, recoverable: 0, noScreenshot: 0 };
+  // Every moment id known to the library.
+  const momentIds = new Set();
+  for (const note of notes || []) {
+    for (const m of note.moments || []) {
+      if (m && m.id) momentIds.add(m.id);
+    }
+  }
+  // Failures are counted once per unique moment/file set.
+  const fileByMoment = new Map();
+  for (const f of parsedFiles || []) {
+    files.total++;
+    if (f.manualShot) {
+      // Independent webpage screenshots (never note moments).
+      files.manual++;
+      continue;
+    }
+    if (!f.momentId) {
+      // A file we own but cannot attribute to any moment.
+      files.invalid++;
+      continue;
+    }
+    if (fileByMoment.has(f.momentId)) {
+      // Two files claim the same moment: only one can be authoritative.
+      files.duplicate++;
+    } else {
+      // The first occurrence is the authoritative file.
+      fileByMoment.set(f.momentId, f.relativePath);
+    }
+    if (momentIds.has(f.momentId)) {
+      // A real moment in the library references this exact file.
+      files.matched++;
+    } else {
+      // A file on disk whose moment is not (yet) in the library.
+      files.recoverable++;
+    }
+  }
+  // ---- Moments ----
+  for (const note of notes || []) {
+    for (const m of note.moments || []) {
+      if (!m || typeof m !== 'object') continue;
+      moments.total++;
+      const hasFile = !!(m.relativePath && fileByMoment.get(m.id) === m.relativePath);
+      if (hasFile) {
+        moments.withFile++;
+      } else if (m.relativePath) {
+        // A recorded path that is NOT among the scanned files: missing on disk.
+        moments.missingFile++;
+      } else if (m.screenshot && m.screenshot.type === 'data-url' && m.screenshot.dataUrl && !m.imageFileName) {
+        // Inline in browser storage, never written to the folder.
+        moments.pending++;
+      } else if (m.saveState === 'failed') {
+        // A write genuinely failed (user sees Retry).
+        moments.failed++;
+      } else if (m.screenshot) {
+        // A remote/blob URL that may or may not resolve - not a real file yet.
+        moments.pending++;
+      } else {
+        // No screenshot reference at all: a pure-text (annotation-only) moment.
+        moments.textOnly++;
+        if (!m.annotation) moments.noScreenshot++;
+      }
+    }
+  }
+  // Return the two breakdowns.
+  return { files, moments };
+}
+
+// Analyze the current library against an image scan. Async convenience wrapper
+// over classifyLibrary (which stays a pure function for tests).
+export async function analyzeLibrary(notes) {
+  // Pull every image path in the folder.
+  const paths = await listImagePaths();
+  // Parse each path into structured metadata.
+  const files = paths.map(parseRelativePath);
+  // Classify and hand it back.
+  return classifyLibrary(files, notes);
 }
 
 // ----------------------- Migration helpers -----------------------

@@ -29,6 +29,11 @@
       this.platform = platform;
       // True while our sidebar container lives inside the host layout.
       this.sidebarMounted = false;
+      // Does this platform play a real video? Video platforms keep the
+      // timestamp/seek pipeline; video-less platforms (ChatGPT) set this to
+      // false so the shared code skips video-bound capture and never shows or
+      // fakes a video timestamp.
+      this.hasVideo = true;
     }
 
     // URL-level checks.
@@ -69,6 +74,25 @@
 
     // Notification that the page just navigated; refresh platform state.
     handleNavigation() {}
+
+    // Enter/exit capture mode. During a page screenshot the container is
+    // hidden with a visibility:hidden class (its layout slot stays put, so the
+    // page never reflows); adapters that run responsive hide/show logic
+    // (ChatGPT) freeze it here so that logic can never fight the capture hide.
+    // Optional - implementations can ignore it.
+    setCapture(on) {}
+
+    // The on-page content area a "page screenshot" should be cropped to, in
+    // CSS viewport pixels, intersected with the visible viewport (null when
+    // the capture should stay full-viewport). The sidebar pre-crops the
+    // captured frame to this rectangle and clamps the interactive selection to
+    // it, so the final image contains ONLY the host content (e.g. the ChatGPT
+    // conversation area) - never the browser chrome, unrelated host controls,
+    // or ClipNote itself. This is deliberately a SEPARATE concept from where
+    // the sidebar is mounted. Video platforms have no on-page content region
+    // and simply inherit the null default (full-viewport captures unchanged).
+    // Optional - implementations can ignore it.
+    getScreenshotTarget() { return null; }
 
     // Full teardown, run when the extension context is invalidated (reload /
     // update) so a takeover copy never inherits this copy's listeners,

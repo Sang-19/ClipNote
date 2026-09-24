@@ -1,16 +1,20 @@
 // ClipNote - interactive webpage screenshot selection.
 //
 // Shared, platform-independent module. When the user clicks "Screenshot" in
-// the sidebar, the sidebar FIRST captures the visible tab; contentScript.js
-// then asks this module to cover the whole page with a temporary selection
-// layer. The layer shows that captured frame as a STATIC, opaque background,
-// so what the user selects is an immutable copy of the page at the moment of
-// capture - the live page (video, animations, UI) may keep running underneath
-// but it is never visible and never part of the selection. The user drags a
-// rectangle (the area outside the rectangle is dimmed, the rectangle itself is
-// highlighted with a live size readout) and the layer is torn down when the
-// drag ends, on Escape, when the window loses focus, or on a plain click (no
-// drag = cancel).
+// the sidebar, the sidebar FIRST captures the visible tab AS IT IS - ClipNote
+// sidebar included, nothing hidden and nothing cropped. contentScript.js then
+// asks this module to cover the whole page with a temporary selection layer.
+// The layer shows that captured frame as a STATIC, opaque background, so what
+// the user confirms or selects is an immutable copy of the page at the moment
+// of capture - the live page (video, animations, UI) may keep running
+// underneath but it is never visible and never part of the selection.
+//
+// By default the ENTIRE visible frame is selected: a plain click (no drag)
+// saves the full page EXACTLY as it was on screen, ClipNote and all. Dragging
+// crops the saved image to the dragged rectangle. The area outside the
+// rectangle is dimmed, the rectangle itself is highlighted with a live size
+// readout. The layer is torn down when the drag ends, on Escape, or when the
+// window loses focus.
 //
 // The overlay sits above EVERYTHING on the host page and swallows pointer,
 // wheel and key events for its whole lifetime, so the video can never be
@@ -19,7 +23,9 @@
 // happens on a fixed full-viewport layer), which is exactly what the captured
 // tab image maps to.
 //
-// Nothing here knows about YouTube, Udemy, or any host DOM.
+// Nothing here knows about YouTube, Udemy, or any host DOM. There is no
+// content-target confinement and no exclusion zone anywhere in this module -
+// the frame is never narrowed, only a straight crop of what was visible.
 
 (() => {
   'use strict';
@@ -64,7 +70,9 @@
     return el;
   }
 
-  // The rectangle currently being dragged, clamped to the viewport.
+  // The rectangle currently being dragged, clamped to the viewport. The full
+  // visible frame stays selectable everywhere, so the user can still pick a
+  // region that overlaps the ClipNote column if they want it in the screenshot.
   function currentRect() {
     const x1 = Math.max(0, Math.min(startX, curX));
     const y1 = Math.max(0, Math.min(startY, curY));
@@ -75,6 +83,19 @@
       y: y1,
       width: x2 - x1,
       height: y2 - y1,
+      viewport: { width: viewportW, height: viewportH }
+    };
+  }
+
+  // The ENTIRE visible frame: the default selection. A plain click (no drag)
+  // confirms this - the whole page exactly as it was on screen, ClipNote and
+  // all - so the saved screenshot is never narrowed unless the user drags.
+  function fullRect() {
+    return {
+      x: 0,
+      y: 0,
+      width: viewportW,
+      height: viewportH,
       viewport: { width: viewportW, height: viewportH }
     };
   }
@@ -135,6 +156,8 @@
 
   function onPointerDown(e) {
     if (e.button !== 0 || selecting) return;
+    // Any press starts a drag anywhere on the frozen frame - the whole visible
+    // page is selectable, ClipNote column included.
     selecting = true;
     startX = curX = e.clientX;
     startY = curY = e.clientY;
@@ -153,9 +176,11 @@
     if (!selecting) return;
     selecting = false;
     const rect = currentRect();
-    // A click without a real drag cancels instead of capturing a sliver.
+    // A click without a real drag confirms the WHOLE frame: the screenshot is
+    // the entire visible tab exactly as it appeared on screen, ClipNote and
+    // all. Only a genuine drag narrows the saved image to that region.
     if (rect.width < MIN_SIZE || rect.height < MIN_SIZE) {
-      cancel();
+      finish(fullRect());
     } else {
       finish(rect);
     }
@@ -204,7 +229,9 @@
   //   options.backgroundImage - data URL of the tab captured by the sidebar.
   //     When present it is rendered as a full-viewport, opaque background so
   //     the live page is visually frozen for the whole selection. When absent
-  //     the layer stays transparent (legacy behaviour).
+  //     the layer stays transparent (legacy behaviour). The frame is the WHOLE
+  //     visible tab - ClipNote sidebar included - so the default (a plain
+  //     click) saves exactly what the user saw.
   function start(options) {
     if (open) cancel();
     open = true;
@@ -230,6 +257,8 @@
     // live page, it never intercepts the drag itself.
     const backgroundImage = (options && options.backgroundImage) || null;
     if (backgroundImage) {
+      // Full-viewport frozen frame - a straight copy of the visible tab,
+      // never narrowed to a content target, never re-composed.
       const bg = makeEl('div', {
         position: 'absolute',
         inset: '0',
@@ -251,7 +280,7 @@
       top: '14px',
       left: '50%',
       transform: 'translateX(-50%)',
-      zIndex: '1',
+      zIndex: '2',
       background: 'rgba(0,0,0,0.78)',
       color: '#fff',
       fontSize: '12px',
@@ -259,7 +288,7 @@
       borderRadius: '6px',
       pointerEvents: 'none',
       whiteSpace: 'nowrap'
-    }, 'Drag to select an area of the page \u00B7 Esc to cancel');
+    }, 'Click to save the whole page \u00B7 or drag to select an area \u00B7 Esc to cancel');
 
     // The empty highlight rectangle. The gigantic box-shadow cannot be set
     // inline, so it lives in a tiny stylesheet scoped to a marker attribute.
@@ -269,7 +298,7 @@
       top: '0',
       width: '0',
       height: '0',
-      zIndex: '2',
+      zIndex: '3',
       border: '2px solid #e07a5f',
       background: 'rgba(224, 122, 95, 0.08)',
       pointerEvents: 'none'
@@ -278,7 +307,7 @@
 
     sizeLabel = makeEl('div', {
       position: 'absolute',
-      zIndex: '3',
+      zIndex: '4',
       background: 'rgba(0,0,0,0.78)',
       color: '#fff',
       fontSize: '11px',
@@ -293,6 +322,11 @@
     overlay.appendChild(box);
     overlay.appendChild(sizeLabel);
     (document.documentElement || document.body).appendChild(overlay);
+
+    // The whole visible frame is selected by default: a plain click keeps it,
+    // a drag narrows it. The highlight starts over the full page so the user
+    // can see exactly what a click will save - ClipNote and all.
+    paintSelection(fullRect());
 
     // The pairing CSS rule for the dim-outside effect.
     const style = document.createElement('style');

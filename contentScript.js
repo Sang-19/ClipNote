@@ -107,6 +107,8 @@
     stopSidebarHealthCheck();
     // Cancel any open screenshot selection overlay (pure DOM, safe).
     cancelScreenOverlay();
+    // Release any active capture hide so a takeover copy never inherits it.
+    setCaptureMode(false);
     // Invalidate any mount that is still waiting for the host DOM.
     mountGeneration++;
     // Remove the sidebar without touching any extension API.
@@ -180,6 +182,73 @@
   // The one and only sidebar health-check observer for this page.
   let sidebarHealthObserver = null;
 
+  // ---------- Capture-mode visibility ----------
+  // While a page capture/screenshot is in flight the sidebar must not appear
+  // in the captured frame. It is hidden with a dedicated CLASS styled
+  // visibility:hidden (never display:none), so the container keeps its layout
+  // slot: ChatGPT's centered chat never reflows, and the platform layout
+  // controller (which owns the container's inline styles) can never wipe the
+  // hide. The active flag also freezes ChatGPT's responsive show/hide logic
+  // for the duration of the capture.
+  let captureModeActive = false;
+  // Safety net: a sidebar that dies mid-capture (reload, conversation switch,
+  // extension shutdown) must not leave the container hidden forever.
+  let captureModeTimer = null;
+  const CAPTURE_MODE_MAX_MS = 60 * 1000;
+  // True when a navigation/thread-swap fired while a capture was in flight.
+  // The capture hides the container and freezes the platform layout, so the
+  // reaction to that event is DEFERRED (see handleNavigation / setCaptureMode):
+  // re-anchoring the sidebar mid-capture is exactly what made it jump.
+  let pendingReanchorAfterCapture = false;
+
+  // Scrolling the host page is never ClipNote's job, but a capture must leave
+  // the view exactly where the user had it. On capture enter we snapshot the
+  // REAL scroll containers (the window AND the platform's actual overflow
+  // element - never assumed to be window) and on exit we restore any drift the
+  // page introduced while the frozen frame was on screen.
+  let captureScrollSnapshot = null;
+
+  // The actual element whose scrollTop moves the conversation. ChatGPT scrolls
+  // an inner container, not the window, so we walk up from the on-page content
+  // element to the first scrollable ancestor instead of assuming window.scrollY.
+  function findCaptureScrollElement() {
+    const el = (adapter && adapter.getContentElement) ? adapter.getContentElement() : null;
+    let n = el && el.parentElement;
+    while (n && n !== document.documentElement) {
+      if (n.scrollHeight > n.clientHeight + 2) return n;
+      n = n.parentElement;
+    }
+    return null;
+  }
+
+  function recordCaptureScroll() {
+    captureScrollSnapshot = {
+      winX: window.scrollX || 0,
+      winY: window.scrollY || 0,
+      el: findCaptureScrollElement(),
+      elTop: 0
+    };
+    if (captureScrollSnapshot.el) captureScrollSnapshot.elTop = captureScrollSnapshot.el.scrollTop || 0;
+  }
+
+  function restoreCaptureScroll() {
+    const s = captureScrollSnapshot;
+    captureScrollSnapshot = null;
+    if (!s) return;
+    // Only ever fix drift the page itself introduced: the selection overlay
+    // blocks every user scroll gesture, so any movement between the snapshot
+    // and now is ChatGPT re-rendering, not the user. Never fight a scroll the
+    // user could actually be performing.
+    try {
+      if (Math.abs((window.scrollX || 0) - s.winX) > 1 || Math.abs((window.scrollY || 0) - s.winY) > 1) {
+        window.scrollTo(s.winX, s.winY);
+      }
+      if (s.el && s.el.isConnected && Math.abs((s.el.scrollTop || 0) - s.elTop) > 1) {
+        s.el.scrollTop = s.elTop;
+      }
+    } catch (e) { /* best effort */ }
+  }
+
   // ----------------------- Platform -----------------------
 
   // Return the site we're running on ("youtube", "udemy", or null).
@@ -192,6 +261,7 @@
     const host = location.hostname.toLowerCase();
     if (host === 'youtube.com' || host === 'www.youtube.com' || host === 'm.youtube.com') return 'youtube';
     if (host === 'udemy.com' || host === 'www.udemy.com') return 'udemy';
+    if (host === 'chatgpt.com' || host === 'www.chatgpt.com' || host === 'chat.openai.com') return 'chatgpt';
     return null;
   }
 
@@ -201,6 +271,14 @@
   // Does the current URL hold a playable video page?
   function isWatchPage() {
     return !!adapter && adapter.isWatchPage();
+  }
+
+  // Does the current platform play a real video? Video platforms (YouTube &
+  // Udemy) keep the timestamp/seek/capture pipeline; video-less platforms
+  // (ChatGPT) must never bind a video, seek, or report a video timestamp - its
+  // moments are genuinely timestamp-free (no video time, no wall-clock label).
+  function needsVideo() {
+    return !!adapter && adapter.hasVideo !== false;
   }
 
   // Build the full "video context" object for the current page. The shape is
@@ -614,6 +692,11 @@
     stopSidebarHealthCheck();
     clearPromotionRetry();
     cancelScreenOverlay();
+    // A navigation deferred from a just-ended capture must NOT re-mount a
+    // sidebar that is being removed on purpose (toggle OFF / leaving page).
+    pendingReanchorAfterCapture = false;
+    // Release any active capture hide before the container is removed.
+    setCaptureMode(false);
     // Invalidate any mount still waiting for the host DOM.
     mountGeneration++;
     if (adapter && adapter.unmountSidebar) {
@@ -622,6 +705,72 @@
       sidebarContainer.remove();
     }
     sidebarContainer = null;
+  }
+
+  // One small stylesheet, injected once, that hides the sidebar during a page
+  // capture WITHOUT collapsing its layout slot. visibility:hidden (not
+  // display:none) keeps the flex column in place, so the chat never jumps;
+  // Chrome's captureVisibleTab composites hidden boxes as invisible, so the
+  // sidebar never appears in the frame. !important wins over any inline style
+  // a platform layout adapter might apply while the hide is active.
+  function ensureCaptureStyle() {
+    if (document.getElementById('cn-capture-style')) return;
+    const style = document.createElement('style');
+    style.id = 'cn-capture-style';
+    style.textContent =
+      '#cn-sidebar-container.cn-capture-hidden{' +
+      'visibility:hidden !important;' +
+      'pointer-events:none !important;' +
+      '}';
+    (document.head || document.documentElement).appendChild(style);
+  }
+
+  // Apply the capture-hide class to the CURRENT container and tell the
+  // platform adapter (ChatGPT) to freeze its responsive logic. Idempotent and
+  // safe to call when no container exists yet.
+  function applyCaptureMode(active) {
+    ensureCaptureStyle();
+    if (adapter && typeof adapter.setCapture === 'function') {
+      try { adapter.setCapture(!!active); } catch (e) { /* best effort */ }
+    }
+    // Always target the CONNECTED container: a stale-but-truthy sidebarContainer
+    // that was orphaned by a page re-render must never swallow the hide class
+    // while the real mounted one stays visible (that would put ClipNote back
+    // into screenshots).
+    const el = (sidebarContainer && sidebarContainer.isConnected)
+      ? sidebarContainer
+      : document.querySelector('#cn-sidebar-container');
+    if (el) el.classList.toggle('cn-capture-hidden', !!active);
+  }
+
+  // Enter/exit capture mode. Entering arms a hard safety timer that releases
+  // the mode if the sidebar never sends the matching exit (sidebar died
+  // mid-capture, navigation during capture, etc.). Any entry re-arms it, so a
+  // repeated click during capture cannot stack timers.
+  function setCaptureMode(active) {
+    clearTimeout(captureModeTimer);
+    captureModeTimer = null;
+    if (active) {
+      captureModeActive = true;
+      // Snapshot the page's real scroll position so the capture never leaves
+      // the user at a different spot than they started.
+      recordCaptureScroll();
+      captureModeTimer = setTimeout(() => setCaptureMode(false), CAPTURE_MODE_MAX_MS);
+    } else {
+      captureModeActive = false;
+    }
+    applyCaptureMode(!!active);
+    // A navigation/re-render was deferred while the capture was active (see
+    // handleNavigation). Replay the re-anchor NOW that the capture hide and
+    // the layout freeze are gone, so the sidebar lands exactly where the
+    // current page puts it - never repositioned mid-capture.
+    if (!active && pendingReanchorAfterCapture) {
+      pendingReanchorAfterCapture = false;
+      runDeferredReanchorAfterCapture();
+    }
+    // The capture is done: hand the view back to the user, exactly where it
+    // was when the flow started (only if the page moved it meanwhile).
+    if (!active) restoreCaptureScroll();
   }
 
   // Cancel any screenshot selection overlay that may be open right now.
@@ -690,7 +839,7 @@
                 // Re-armed here too: after OFF -> ON the observer was stopped
                 // by removeSidebar() even if the container itself survived.
                 startSidebarHealthCheck();
-                ensureVideo();
+                if (needsVideo()) ensureVideo();
               } else {
                 removeSidebar();
               }
@@ -741,28 +890,50 @@
               return;
             }
 
-            // Confirm we can report a real timestamp before asking the user to
-            // drag anything. Try to recover a missing/stale video first.
-            let ts = currentVideoTime();
-            if (ts == null) {
-              videoEl = await findVideo(2000);
+            // Video platforms must prove a real, playable timestamp before the
+            // frozen layer opens: a screenshot Moment must never be stamped
+            // with a fake 00:00 because the video happened to be missing.
+            // Video-less platforms (ChatGPT) have no video to bind, seek, pause
+            // or timestamp, so those steps are skipped and the Moment carries
+            // the real wall clock instead of a fake video position.
+            let ts = 0;
+            if (needsVideo()) {
               ts = currentVideoTime();
-            }
-            if (ts == null) {
-              sendResponse({ ok: false, error: 'Video is not ready. Please try again.' });
-              return;
+              if (ts == null) {
+                videoEl = await findVideo(2000);
+                ts = currentVideoTime();
+              }
+              if (ts == null) {
+                sendResponse({ ok: false, error: 'Video is not ready. Please try again.' });
+                return;
+              }
+
+              // Freeze the live player while the frozen frame is shown. The frame
+              // itself is the authoritative static surface (opaque, immovable);
+              // pausing the video just stops the soundtrack and any player
+              // animation progressing behind it. Restored on finish/cancel below.
+              if (videoEl && videoEl.isConnected && !videoEl.paused) {
+                wasPlaying = true;
+                videoEl.pause();
+              }
             }
 
-            // Freeze the live player while the frozen frame is shown. The frame
-            // itself is the authoritative static surface (opaque, immovable);
-            // pausing the video just stops the soundtrack and any player
-            // animation progressing behind it. Restored on finish/cancel below.
-            if (videoEl && videoEl.isConnected && !videoEl.paused) {
-              wasPlaying = true;
-              videoEl.pause();
-            }
-
-            const rect = await CN.ScreenshotSelector.start({ backgroundImage: msg.dataUrl });
+            // Pass the target content rectangle through when the sidebar
+            // pre-cropped the preview to an on-page region (ChatGPT): the
+            // layer then positions the frame exactly over that region and
+            // clamps the selection to it, so the user can only pick content
+            // area. Video platforms send no target and keep the full-viewport
+            // layer.
+            const t = msg.target;
+            const target = (t && Number.isFinite(t.x) && Number.isFinite(t.y)
+              && Number.isFinite(t.width) && Number.isFinite(t.height)
+              && t.width > 1 && t.height > 1)
+              ? { x: t.x, y: t.y, width: t.width, height: t.height }
+              : null;
+            const rect = await CN.ScreenshotSelector.start({
+              backgroundImage: msg.dataUrl,
+              target
+            });
             // The 3-second window of the overlay is enough for navigation: if
             // the page moved on, never create a Moment against the new video.
             if (gen !== navigationGeneration) {
@@ -777,24 +948,26 @@
               return;
             }
 
-            // The video may have been replaced while the user dragged; refresh
-            // the timestamp from the current binding, or abort. A navigation
-            // during the repair must NEVER pair this crop with the video that
-            // exists NOW - the selection started on the previous video.
-            if (currentVideoTime() == null) {
-              videoEl = await findVideo(2000);
-              if (gen !== navigationGeneration) {
-                if (CN && CN.ScreenshotSelector && CN.ScreenshotSelector.cancel) CN.ScreenshotSelector.cancel();
+            if (needsVideo()) {
+              // The video may have been replaced while the user dragged; refresh
+              // the timestamp from the current binding, or abort. A navigation
+              // during the repair must NEVER pair this crop with the video that
+              // exists NOW - the selection started on the previous video.
+              if (currentVideoTime() == null) {
+                videoEl = await findVideo(2000);
+                if (gen !== navigationGeneration) {
+                  if (CN && CN.ScreenshotSelector && CN.ScreenshotSelector.cancel) CN.ScreenshotSelector.cancel();
+                  restoreVideo();
+                  sendResponse({ ok: false, cancelled: true });
+                  return;
+                }
+              }
+              ts = currentVideoTime();
+              if (ts == null) {
                 restoreVideo();
-                sendResponse({ ok: false, cancelled: true });
+                sendResponse({ ok: false, error: 'Video is not ready. Please try again.' });
                 return;
               }
-            }
-            ts = currentVideoTime();
-            if (ts == null) {
-              restoreVideo();
-              sendResponse({ ok: false, error: 'Video is not ready. Please try again.' });
-              return;
             }
             // Snapshot the video context at the same logical moment as the
             // timestamp; the sidebar stores both on the screenshot Moment.
@@ -805,7 +978,9 @@
               ok: true,
               rect,
               timestamp: ts,
-              humanTime: formatTimestamp(ts),
+              // Video platforms report the video position as friendly text;
+              // ChatGPT is timestamp-free, so it never carries a capture time.
+              humanTime: needsVideo() ? formatTimestamp(ts) : '',
               platform: (context && context.platform) || (adapter && adapter.platform) || '',
               videoId: (context && (context.videoId || context.lectureId)) || '',
               videoUrl: buildMomentVideoUrl(context, ts)
@@ -843,35 +1018,84 @@
         return;
       }
 
-      // The sidebar temporarily hides the on-page container before capturing the
-      // visible tab, so the ClipNote UI itself never appears inside a page
-      // screenshot. Visibility is toggled with a saved inline-styles value so
-      // the exact prior state is restored even if the capture fails.
-      if (msg.type === 'CN_HOST_VISIBILITY') {
-        (async () => {
-          try {
-            // Bind the CURRENT container (even when a navigation replaced it).
-            const el = sidebarContainer || document.querySelector('#cn-sidebar-container');
-            if (el) {
-              if (msg.visible) {
-                if (el.dataset && el.dataset.cnRestoreDisplay !== undefined) {
-                  const prior = el.dataset.cnRestoreDisplay;
-                  delete el.dataset.cnRestoreDisplay;
-                  el.style.display = prior || '';
-                }
-              } else {
-                if (el.dataset && el.dataset.cnRestoreDisplay === undefined) {
-                  el.dataset.cnRestoreDisplay = el.style.display;
-                }
-                el.style.display = 'none';
-              }
-            }
-            sendResponse({ ok: true });
-          } catch (e) {
-            sendResponse({ ok: false, error: e && e.message ? e.message : String(e) });
+      // The sidebar temporarily hides the on-page container while it captures
+      // the visible tab, so the ClipNote UI itself never appears inside a page
+      // screenshot. Hiding uses a dedicated visibility:hidden CLASS (see
+      // ensureCaptureStyle) - never display:none - so the container keeps its
+      // layout slot and ChatGPT's centered chat never reflows (this was the
+      // capture flicker: the old inline display:none collapsed the flex column
+      // and the platform's show()/applyLayout() could wipe it mid-capture).
+      // The platform adapter (ChatGPT) also gets a capture-freeze so its
+      // responsive show/hide cannot fight the hide while the capture runs.
+      // A hard safety timer releases the mode if the sidebar never exits it.
+      if (msg.type === 'CN_CAPTURE_MODE') {
+        try { setCaptureMode(!!msg.active); } catch (e) { console.error('[SNT] capture-mode toggle threw', e); }
+        sendResponse({ ok: true });
+        return;
+      }
+
+      // The sidebar asks where the on-page CONTENT area is, so page screenshots
+      // can be cropped down to just the host content (e.g. the ChatGPT
+      // conversation region) instead of the whole browser viewport. The adapter
+      // answers with a CSS-viewport-pixel rectangle of a STABLE element
+      // (data-* / id - never generated class names); video platforms have no
+      // such region and return null, keeping their full-viewport captures as-is.
+      // The reply ALSO carries the ClipNote container's own visible rectangle
+      // (`clip`) so the sidebar can cut that column out of any fallback crop -
+      // the sidebar must never appear in a saved image even when the platform
+      // content target is unavailable - plus the page viewport and platform.
+      if (msg.type === 'CN_GET_SCREENSHOT_TARGET') {
+        let target = null;
+        if (adapter && typeof adapter.getScreenshotTarget === 'function') {
+          try { target = adapter.getScreenshotTarget() || null; } catch (e) { target = null; }
+        }
+        const el = (sidebarContainer && sidebarContainer.isConnected)
+          ? sidebarContainer
+          : document.querySelector('#cn-sidebar-container');
+        let clip = null;
+        if (el && el.isConnected) {
+          const r = el.getBoundingClientRect();
+          const vw = window.innerWidth;
+          const vh = window.innerHeight;
+          const x1 = Math.max(0, r.left);
+          const y1 = Math.max(0, r.top);
+          const x2 = Math.min(vw, r.right);
+          const y2 = Math.min(vh, r.bottom);
+          if (x2 - x1 > 1 && y2 - y1 > 1 && getComputedStyle(el).visibility !== 'hidden') {
+            clip = { x: x1, y: y1, width: x2 - x1, height: y2 - y1 };
           }
-        })();
-        return true;
+        }
+        sendResponse({
+          ok: true,
+          target,
+          clip,
+          viewport: { width: window.innerWidth, height: window.innerHeight },
+          platform: (adapter && adapter.platform) || ''
+        });
+        return;
+      }
+
+      // The sidebar verifies the capture-hide actually LANDED AND PAINTED
+      // before it shoots the visible tab (a busy ChatGPT main thread can delay
+      // the visibility flush past a fixed sleep, and shooting before it paints
+      // would put ClipNote INTO the frame - the exact bug this closes). The
+      // sidebar polls this until hidden:true (bounded), then waits one more
+      // compositor frame before calling captureVisibleTab.
+      if (msg.type === 'CN_CAPTURE_STATE') {
+        const el = (sidebarContainer && sidebarContainer.isConnected)
+          ? sidebarContainer
+          : document.querySelector('#cn-sidebar-container');
+        const connected = !!el;
+        // With a container present, hidden == the capture class is applied AND
+        // the computed style agrees (the class rule uses visibility:hidden
+        // !important, so recalc is synchronous with the toggle). With NO
+        // container mounted there is nothing of ours on the page that could
+        // appear in a frame, so the capture state is trivially satisfied.
+        let hidden = !connected ||
+          el.classList.contains('cn-capture-hidden') &&
+          getComputedStyle(el).visibility === 'hidden';
+        sendResponse({ ok: true, hidden, connected });
+        return;
       }
 
       // The sidebar asked the video to jump to a time.
@@ -906,13 +1130,34 @@
         (async () => {
           const gen = navigationGeneration;
           try {
-            if (!(await ensureVideo())) throw new Error('No video element found');
-            // A capture must never produce a 00:00 Moment from a stale, dead,
-            // or broken video handle.
-            if (currentVideoTime() == null) throw new Error('Video is not ready. Please try again.');
-            const cap = await captureFrame();
+            let cap;
+            if (needsVideo()) {
+              if (!(await ensureVideo())) throw new Error('No video element found');
+              // A capture must never produce a 00:00 Moment from a stale, dead,
+              // or broken video handle.
+              if (currentVideoTime() == null) throw new Error('Video is not ready. Please try again.');
+              cap = await captureFrame();
+            } else {
+              // Video-less platform (ChatGPT): "Capture" means "save what is
+              // visible in the window". Content scripts cannot call
+              // chrome.tabs.captureVisibleTab, so the sidebar captures the
+              // visible tab itself and this handler only carries the page's
+              // context snapshot. ChatGPT moments are genuinely timestamp-free:
+              // no video timestamp, no wall-clock capture time, no fake time.
+              const context = getVideoContext();
+              cap = {
+                id: uuid(),
+                screenshot: { type: 'none' },
+                annotation: '',
+                platform: (context && context.platform) || (adapter && adapter.platform) || '',
+                videoId: (context && (context.videoId || context.lectureId)) || '',
+                videoUrl: (context && context.videoUrl) || ''
+              };
+            }
             if (gen !== navigationGeneration) throw new Error('The page changed during capture. Please try again.');
-            showToast(`Captured at ${cap.humanTime}`);
+            // Video platforms report the captured video time; ChatGPT never has
+            // one to report, so its toast carries no time at all.
+            showToast(cap && cap.humanTime ? `Captured at ${cap.humanTime}` : 'Captured');
             sendResponse({ ok: true, capture: cap });
           } catch (e) {
             sendResponse({ ok: false, error: e.message || String(e) });
@@ -987,9 +1232,30 @@
     }
     try {
       if (!cnEnabled) return;
+      // A page capture/screenshot may be in flight: the sidebar hides the
+      // on-page container and the platform layout is frozen while the shot is
+      // taken. The platform's own navigation/thread observer can still fire in
+      // that window (ChatGPT silently swaps its #thread/#main subtrees on its
+      // own re-renders), and this handler MUST NOT react to that DOM churn by
+      // force-exiting the capture hide or re-anchoring the sidebar - that
+      // repositioning mid-capture is what made the sidebar jump to a different
+      // spot during screenshots. Instead: invalidate any stale in-flight
+      // selection (navigationGeneration++) and DEFER the re-anchor until the
+      // capture exits (the frozen overlay blocks input, so a real navigation
+      // can never race us). The capture-mode safety timer is our backstop if
+      // the sidebar never sends the matching exit.
+      if (captureModeActive) {
+        navigationGeneration++;
+        pendingReanchorAfterCapture = true;
+        return;
+      }
       // The URL changed: invalidate any in-flight capture/screenshot that was
       // working against the previous video so it can never commit stale data.
       navigationGeneration++;
+      // If the user navigated mid-capture (e.g. switched conversations), the
+      // old sidebar's capture hide must not linger on the new page. (When a
+      // capture was active this is handled by the deferred re-anchor instead.)
+      setCaptureMode(false);
       // Forget the old video so we go find the new one.
       videoEl = null;
 
@@ -1011,12 +1277,48 @@
       } else {
         await injectSidebar();
       }
-      ensureVideo();
-      // A navigation often lands exactly on a lecture a Moment was opened for;
-      // apply (and clear) any matching one-shot seek, e.g. Udemy SPA turns.
-      consumePendingSeek();
+      if (needsVideo()) {
+        // Bind the new video and apply (and clear) any matching one-shot seek,
+        // e.g. Udemy SPA turns. Video-less platforms (ChatGPT) have neither.
+        ensureVideo();
+        consumePendingSeek();
+      }
     } catch (e) {
       console.error('[SNT] navigation error', e);
+    }
+  }
+
+  // Replay the part of handleNavigation() that had to wait for a capture to
+  // finish. Once the capture hide and the platform layout freeze are gone, the
+  // sidebar can safely re-anchor into whatever the page looks like NOW - so a
+  // #thread/#main re-render (or a real navigation) that happened mid-capture
+  // leaves the sidebar exactly where the current page puts it.
+  async function runDeferredReanchorAfterCapture() {
+    if (!isContextValid()) {
+      shutdownInvalidatedContext();
+      return;
+    }
+    try {
+      if (!cnEnabled) return;
+      if (!isWatchPage()) {
+        removeSidebar();
+        return;
+      }
+      if (adapter && adapter.handleNavigation) adapter.handleNavigation();
+      if (sidebarContainer && sidebarContainer.isConnected) {
+        if (adapter && adapter.applyLayout) {
+          const ok = adapter.applyLayout(sidebarContainer);
+          if (!ok) startPromotionRetry();
+        }
+      } else if (!sidebarContainer) {
+        await injectSidebar();
+      }
+      if (needsVideo()) {
+        ensureVideo();
+        consumePendingSeek();
+      }
+    } catch (e) {
+      console.error('[SNT] deferred re-anchor error', e);
     }
   }
 
@@ -1149,6 +1451,7 @@
     // duplicate-run guard the fallback injection would skip registering too.
     setupMessageHandlers();
     setupNavigationWatchers();
+    ensureCaptureStyle();
     if (adapter && adapter.setupNavigation) adapter.setupNavigation(handleNavigation);
 
     // Read the flag from the new key, falling back to the pre-rename key.
@@ -1179,10 +1482,13 @@
     // sidebar, no video polling, no capture pipeline.
     if (cnEnabled && isWatchPage()) {
       await injectSidebar();
-      videoEl = await findVideo();
-      // A page that just opened after a Moment click may carry a one-shot
-      // "seek this lecture" request; apply (and clear) it when it matches.
-      consumePendingSeek();
+      // Video platforms bind the player and may carry a one-shot "seek this
+      // lecture" request from a moment click. Video-less platforms (ChatGPT)
+      // have no video to bind and nothing to seek.
+      if (needsVideo()) {
+        videoEl = await findVideo();
+        consumePendingSeek();
+      }
     }
   }
 

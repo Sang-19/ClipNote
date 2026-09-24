@@ -33,17 +33,19 @@ let currentEnabled = false;
 // Serializes the toggle so a second click can never overlap/desync the write.
 let toggleLock = null;
 
-// Check if a URL belongs to a supported video site.
+// Check if a URL belongs to a supported video/chat site.
 function isSupportedSite(url) {
   // Parse the hostname and compare against the same explicit allowlist the
   // content scripts use, so e.g. music.youtube.com is not injected into.
   try {
     const host = new URL(url).hostname.toLowerCase();
     return host === 'youtube.com' || host === 'www.youtube.com' || host === 'm.youtube.com' ||
-      host === 'udemy.com' || host === 'www.udemy.com';
+      host === 'udemy.com' || host === 'www.udemy.com' ||
+      host === 'chatgpt.com' || host === 'www.chatgpt.com' || host === 'chat.openai.com';
   } catch (e) {
     // Unparsable URL: fall back to the old substring check.
-    return !!url && (url.includes('youtube.com') || url.includes('udemy.com'));
+    return !!url && (url.includes('youtube.com') || url.includes('udemy.com') ||
+      url.includes('chatgpt.com') || url.includes('chat.openai.com'));
   }
 }
 
@@ -71,6 +73,11 @@ async function applyToTab(enabled) {
       'platforms/youtube/youtube-video.js',
       'platforms/youtube/youtube-navigation.js',
       'platforms/youtube/youtube.js',
+      'platforms/chatgpt/chatgpt-selectors.js',
+      'platforms/chatgpt/chatgpt-chat.js',
+      'platforms/chatgpt/chatgpt-layout.js',
+      'platforms/chatgpt/chatgpt-navigation.js',
+      'platforms/chatgpt/chatgpt.js',
       'platforms/shared/screenshot-selector.js',
       'contentScript.js'
     ];

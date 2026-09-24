@@ -251,6 +251,14 @@ import * as ls from '../local-storage.js';
   let dragReorder = null;
   // The animation frame id used for auto-scroll while dragging.
   let dragScrollRaf = 0;
+  // How many of OUR chrome.storage writes are still in flight. The onChanged
+  // reload listener uses this to ignore the sidebar's own writes (which would
+  // otherwise re-render everything on every keystroke) while still reacting to
+  // EXTERNAL changes (e.g. Rebuild Library on the Storage page).
+  let storageWriteInFlight = 0;
+  // True from boot until init() finishes its first load, so storage.onChanged
+  // events raised by the migration/reload machinery are not double-handled.
+  let bootstrapping = true;
 
   // ----------------------- Deletion safety state -----------------------
   // Notes whose deletion has begun (or finished). Checked SYNCHRONOUSLY before
@@ -318,16 +326,61 @@ import * as ls from '../local-storage.js';
     }));
   }
 
-  // Save all notes to Chrome's storage (without the images).
+  // Save all notes to Chrome's storage (without the images). Every record is
+  // normalized first (schema v4) so the stored library always carries its
+  // schemaVersion and canonical moment ids. The in-flight counter lets the
+  // storage.onChanged reload listener tell OUR writes apart from external ones.
   async function saveAllNotes() {
-    // Write the notes with screenshots stripped out.
-    await storage.set({ [NOTE_KEY]: stripScreenshots(allNotes) });
+    // Preserve the inline screenshot on moments not yet written to the folder
+    // while dropping it from the persisted copy.
+    storageWriteInFlight++;
+    try {
+      await storage.set({ [NOTE_KEY]: stripScreenshots(ls.normalizeNotes(allNotes)) });
+    } finally {
+      storageWriteInFlight = Math.max(0, storageWriteInFlight - 1);
+    }
   }
 
   // Make sure every moment's sortOrder matches its position in the note.
   function refreshSortOrders(note) {
     // Walk the moments and stamp their index as the sort order.
     (note.moments || []).forEach((m, i) => { m.sortOrder = i; });
+  }
+
+  // Best-effort download of a remote image (thumbnails, posters, fallback
+  // previews) into a data URL, so it can be persisted to the shared folder.
+  // Returns null when the fetch is blocked (CORS/offline) or not an image.
+  async function fetchRemoteImageDataUrl(remoteUrl) {
+    try {
+      // A normal CORS fetch is all that is needed for public CDNs.
+      const res = await fetch(remoteUrl, { mode: 'cors' });
+      // Only success yields a body.
+      if (!res.ok) return null;
+      // Read it as a blob.
+      const blob = await res.blob();
+      // Re-encode through an <img> + canvas so the persisted file is always a
+      // clean JPEG in our folder (and CORS-purposed blobs are handled safely).
+      if (typeof URL.createObjectURL === 'function') {
+        const url = URL.createObjectURL(blob);
+        try {
+          const img = await loadImage(url);
+          const canvas = document.createElement('canvas');
+          canvas.width = img.naturalWidth || 1;
+          canvas.height = img.naturalHeight || 1;
+          const ctx = canvas.getContext('2d');
+          ctx.drawImage(img, 0, 0);
+          const out = canvas.toDataURL('image/jpeg', 0.92);
+          // Only accept a real image back.
+          if (typeof out === 'string' && out.startsWith('data:image/')) return out;
+        } finally {
+          URL.revokeObjectURL(url);
+        }
+      }
+      return null;
+    } catch (e) {
+      // CORS/offline/etc.: nothing to persist, the card labels it for a retry.
+      return null;
+    }
   }
 
   // Write one moment's screenshot into the user's chosen folder.
@@ -372,8 +425,49 @@ import * as ls from '../local-storage.js';
           moment.saveError = null;
           // Remember the change.
           newState = 'unavailable';
-        } else if (!moment.screenshot || moment.screenshot.type !== 'data-url') {
-          // There's no inline image to save (e.g. a remote fallback thumbnail).
+        } else if (moment.screenshot && moment.screenshot.type === 'remote-url' && moment.screenshot.url) {
+          // A distant/fallback thumbnail (e.g. a YouTube video preview image).
+          // Try to download it and persist the real file to the folder so EVERY
+          // install (and a storage wipe) can recover it from disk. Best effort:
+          // a CORS-blocked/offline fetch leaves the moment on its remote preview
+          // with an explicit "remote-unsaved" state and a Retry button.
+          const dataUrl = await fetchRemoteImageDataUrl(moment.screenshot.url);
+          if (!dataUrl) {
+            // The remote image could not be fetched: keep the preview, but flag
+            // that the library cannot yet restore it from the folder.
+            moment.saveState = 'remote-unsaved';
+            moment.saveError = null;
+            newState = 'remote-unsaved';
+          } else {
+            // A temporary data-url shell is written exactly like a real capture,
+            // so the original-quality file lands in the note's own folder.
+            if (tombstonedNotes.has(note.id)) return;
+            if (tombstonesMoments.has(key)) return;
+            if (!findNote(note.id)) return;
+            const tmp = { ...moment, screenshot: { type: 'data-url', dataUrl } };
+            const relativePath = await ls.saveScreenshotFile({ note, moment: tmp });
+            // The note may still have been deleted while the file was written;
+            // do not then touch the (recreated) folder or persist metadata.
+            if (tombstonedNotes.has(note.id)) return;
+            if (!findNote(note.id)) return;
+            // Stamp the relative reference on the moment.
+            moment.relativePath = relativePath;
+            moment.imageFileName = relativePath.split('/').pop();
+            moment.saveState = 'saved';
+            moment.saveError = null;
+            newState = 'saved';
+            // The folder now carries the metadata sidecar as well.
+            await ls.saveNoteSidecar(note);
+            // Swap the remote preview for a blob of the saved file (best effort).
+            try {
+              const preview = await ls.readBlobUrl(moment.relativePath);
+              if (preview) moment.screenshot = { type: 'blob-url', url: preview };
+            } catch (e) { /* keep the remote-url preview */ }
+          }
+        } else if (!moment.screenshot || moment.screenshot.type !== 'data-url' || !moment.screenshot.dataUrl) {
+          // No inline image to save and no remote source either: a genuine
+          // text-only moment (annotation with no captured image). It stays a
+          // valid moment; there is simply nothing to write to the folder.
           moment.saveState = 'noimage';
           newState = 'noimage';
         } else {
@@ -476,44 +570,38 @@ import * as ls from '../local-storage.js';
     renderMoments();
   }
 
-  // Coerce a raw stored moment into a safe shape (or null when unusable).
-  function sanitizeMoment(raw) {
-    // A moment must at least look like an object.
-    if (!raw || typeof raw !== 'object') return null;
-    // Require the fields the UI depends on.
-    if (typeof raw.id !== 'string' || !raw.id) return null;
-    if (typeof raw.timestamp !== 'number' || !Number.isFinite(raw.timestamp) || raw.timestamp < 0) {
-      raw.timestamp = 0;
-    }
-    if (typeof raw.humanTime !== 'string') raw.humanTime = formatTimestamp(raw.timestamp);
-    if (typeof raw.annotation !== 'string') raw.annotation = '';
-    return raw;
+  // Coerce a raw stored moment into a canonical shape. Delegates to
+  // ls.normalizeMoment (schema v4): a moment with a missing/invalid id is now
+  // given a DETERMINISTIC id instead of being dropped (data-loss fix).
+  function sanitizeMoment(raw, index, note) {
+    return ls.normalizeMoment(raw, index, note);
   }
 
-  // Coerce a raw stored note into a safe shape (or null when unusable).
-  function sanitizeNote(raw) {
-    if (!raw || typeof raw !== 'object') return null;
-    if (typeof raw.id !== 'string' || !raw.id) return null;
-    if (typeof raw.title !== 'string') raw.title = 'Untitled';
-    // Keep only moments that survive sanitization.
-    const moments = Array.isArray(raw.moments)
-      ? raw.moments.map(sanitizeMoment).filter(Boolean)
-      : [];
-    raw.moments = moments;
-    return raw;
+  // Coerce a raw stored note into a canonical shape (schema v4). Delegates to
+  // ls.normalizeNote; a missing new field is an OPTIONAL field, never invalid.
+  function sanitizeNote(raw, index) {
+    return ls.normalizeNote(raw, index);
   }
 
-  // Load all notes, then attach their images from IndexedDB.
+  // Load all notes, then attach their images (filesystem FIRST, browser caches
+  // only as a fallback - the folder is the cross-install source of truth).
   async function loadAllNotes() {
     // Read the stored notes.
     const data = await storage.get(NOTE_KEY);
     // Use the stored list, or an empty list if there's none.
     const rawList = (data && Array.isArray(data)) ? data : [];
-    // Defensive validation: drop any malformed entries that would otherwise
-    // crash the renderers or corrupt the in-memory state.
-    allNotes = rawList.map(sanitizeNote).filter(Boolean);
+    // Normalize every record (idempotent, non-destructive, never drops).
+    const normalized = rawList.map(sanitizeNote).filter(Boolean);
+    // Was any record still on an older schema? If so, persist the migration
+    // once so the stored library and the filesystem sidecars stay in step.
+    const needsMigration = rawList.some((r) => r && r.schemaVersion !== 4);
+    allNotes = normalized;
+    if (needsMigration) {
+      await saveAllNotes();
+    }
 
-    // Rehydrate screenshots from IndexedDB where they were stripped.
+    // Rehydrate screenshots: the FILESYSTEM is authoritative (relative path),
+    // IndexedDB only a temporary cache for moments not yet written to disk.
     // Loop over every note.
     for (const note of allNotes) {
       // Loop over every moment in the note.
@@ -525,16 +613,18 @@ import * as ls from '../local-storage.js';
         if (typeof moment.sortOrder !== 'number') moment.sortOrder = note.moments.indexOf(moment);
         // If this moment has no screenshot yet:
         if (!moment.screenshot || moment.screenshot.type === 'none') {
-          // Try to load its image from IndexedDB.
-          const saved = await idbGet(shotKey(note.id, moment.id));
-          // If we found it, put it back on the moment.
-          if (saved) moment.screenshot = saved;
-          // Otherwise, if it points at a file in the folder, show that:
-          else if (moment.relativePath) {
+          // A file on disk always wins: read it fresh from the folder.
+          if (moment.relativePath) {
             // Build a displayable preview straight from the file.
             const url = await ls.readBlobUrl(moment.relativePath);
-            // If we got a preview, use it.
+            // If we got a preview, use it (never a broken URL: the render pass
+            // re-resolves on demand whenever this cache entry is missing).
             if (url) moment.screenshot = { type: 'blob-url', url };
+          } else {
+            // No file: the browser cache (IndexedDB) may still hold the image.
+            const saved = await idbGet(shotKey(note.id, moment.id));
+            // If we found it, put it back on the moment.
+            if (saved) moment.screenshot = saved;
           }
         }
       }
@@ -637,6 +727,35 @@ import * as ls from '../local-storage.js';
   function getActiveNote() {
     // Look it up by the stored active id.
     return findNote(activeNoteId);
+  }
+
+  // Reload the library from chrome.storage after an EXTERNAL change (e.g. the
+  // Storage page's "Rebuild Library"), preserving the open note when it still
+  // exists. Debounced so a rapid burst of notifications collapses to one pass.
+  let reloadTimer = null;
+  function reloadNotesFromStorage() {
+    clearTimeout(reloadTimer);
+    reloadTimer = setTimeout(async () => {
+      // The reload is fire-and-forget; a failure must surface nowhere and never
+      // tear down the sidebar, so the whole pass is guarded.
+      try {
+        // Preserve the current selection where possible.
+        const wasId = activeNoteId;
+        // Re-read and normalize (the previous contents can be gone entirely).
+        await loadAllNotes();
+        // Re-read the manual screenshots as well (both live in browser storage).
+        await loadManualShots();
+        // Is the previously open note still there after the rebuild?
+        if (wasId && findNote(wasId)) {
+          activeNoteId = wasId;
+          renderMoments();
+        } else {
+          // The note vanished (or never existed): go back to the home view.
+          activeNoteId = null;
+          showHomeView();
+        }
+      } catch (e) { /* keep the UI alive on reload failures */ }
+    }, 300);
   }
 
   // ----------------------- Own-tab targeting -----------------------
@@ -779,6 +898,17 @@ import * as ls from '../local-storage.js';
     return `${String(m).padStart(2, '0')}:${String(s).padStart(2, '0')}`;
   }
 
+  // Do notes/moments for this platform refer to a real video? Video platforms
+  // (YouTube & Udemy) keep the timestamp/seek/jump UI exactly as before; the
+  // video-less platform (ChatGPT) never shows a timestamp, duration, seek
+  // control or fake time - its captures simply mean "what is on screen now".
+  // The decision is made from the platform, never by branching on YouTube or
+  // Udemy specifics.
+  function platformHasVideo(platform) {
+    const p = platform || 'youtube';
+    return p === 'youtube' || p === 'udemy';
+  }
+
   // Escape user-controlled text before it is interpolated into HTML we build.
   // Used by the PDF export so note titles/annotations always render as plain
   // text and can never turn into executable markup.
@@ -827,6 +957,71 @@ import * as ls from '../local-storage.js';
   async function getVideoContext() {
     // Send the context request and return its reply.
     return await sendToContentScript({ type: 'CN_GET_VIDEO_CONTEXT' });
+  }
+
+  // Ask the content script where the on-page CONTENT area is, so the ChatGPT
+  // "+ Capture" moment can be cropped down to just the host conversation region
+  // instead of the whole browser viewport. The platform adapter answers with a
+  // CSS-viewport-pixel rectangle of a stable element; video platforms have no
+  // such region and return null. Only the ChatGPT "+ Capture" flow uses this
+  // today - the shared Screenshot flow keeps the full visible frame.
+  async function getScreenshotTarget() {
+    const res = await sendToContentScript({ type: 'CN_GET_SCREENSHOT_TARGET' });
+    if (!res || !res.ok) return null;
+    // The full capture plan: the on-page CONTENT target (ChatGPT conversation
+    // region), the ClipNote container's own visible rectangle (the fallback
+    // exclusion zone), the page viewport and the platform. All in CSS viewport
+    // pixels, computed against the SAME layout the frame will be shot in, so
+    // the crop that follows is pixel-accurate.
+    return {
+      target: (res.target && res.target.width > 1 && res.target.height > 1) ? res.target : null,
+      clip: (res.clip && res.clip.width > 1 && res.clip.height > 1) ? res.clip : null,
+      viewport: (res.viewport && res.viewport.width > 1 && res.viewport.height > 1) ? res.viewport : null,
+      platform: (typeof res.platform === 'string' && res.platform) ? res.platform : ''
+    };
+  }
+
+  // The rectangle (CSS viewport px, with its viewport snapshot) the ChatGPT
+  // "+ Capture" saved image must stay inside. The on-page CONTENT target (the
+  // conversation region) is authoritative when the content script provides
+  // one; otherwise the ClipNote column is cut out of the viewport on the
+  // larger side. Used ONLY by captureChatgptMoment - the shared Screenshot
+  // flow keeps the full visible frame and never goes through this function.
+  function resolveCaptureRect(plan) {
+    if (plan && plan.target) {
+      return {
+        x: plan.target.x, y: plan.target.y,
+        width: plan.target.width, height: plan.target.height,
+        // Prefer the plan's viewport; fall back to the one the target carried
+        // itself (older content scripts attach it to the target, not the plan).
+        viewport: (plan.viewport && plan.viewport.width) ? plan.viewport : plan.target.viewport
+      };
+    }
+    // No on-page content target: cut the ClipNote column itself out of the
+    // frame, keeping the larger side of the column.
+    if (plan && plan.clip && plan.viewport) {
+      const leftArea = plan.clip.x;
+      const rightArea = plan.viewport.width - (plan.clip.x + plan.clip.width);
+      if (leftArea > rightArea) {
+        // Right-hand column: the host content is everything left of it.
+        return {
+          x: 0, y: 0,
+          width: Math.max(1, leftArea),
+          height: plan.viewport.height,
+          viewport: plan.viewport
+        };
+      }
+      if (rightArea > 1) {
+        // Left-hand column: the host content is everything right of it.
+        return {
+          x: Math.floor(plan.clip.x + plan.clip.width), y: 0,
+          width: Math.max(1, rightArea),
+          height: plan.viewport.height,
+          viewport: plan.viewport
+        };
+      }
+    }
+    return null;
   }
 
   // Ask the content script to capture the current frame.
@@ -935,10 +1130,17 @@ import * as ls from '../local-storage.js';
     note.moments.push({
       // The moment's unique id.
       id: momentId,
-      // When in the video it was captured.
-      timestamp: cap.timestamp || 0,
-      // The same time as friendly text.
-      humanTime: cap.humanTime || formatTimestamp(cap.timestamp || 0),
+      // VIDEO platforms only: when in the video it was captured, plus the same
+      // time as friendly text. ChatGPT moments are genuinely timestamp-free and
+      // never carry these fields (no video time, no wall-clock capture time) -
+      // the platform decision is made from the capture's own platform, never by
+      // faking a value here.
+      ...((cap.platform || note.platform || 'youtube') === 'chatgpt'
+        ? {}
+        : {
+            timestamp: cap.timestamp || 0,
+            humanTime: cap.humanTime || formatTimestamp(cap.timestamp || 0)
+          }),
       // The video snapshot THIS moment belongs to. Every moment keeps its own
       // source video (platform/videoId/videoUrl captured at capture time), so
       // moments captured after navigating to another video still point at the
@@ -1002,8 +1204,18 @@ import * as ls from '../local-storage.js';
     setCapturing(true);
     // Guard against errors while capturing.
     try {
-      // Capture whatever is on screen right now.
-      const cap = await captureNow();
+      // Capture whatever is on screen right now. On a video-less platform
+      // (ChatGPT) "Capture" means saving the visible window, which only the
+      // extension's own captureVisibleTab can do - the content script has no
+      // video to draw and must never fake one.
+      let cap = null;
+      const ctx = await getVideoContext();
+      const platform = (ctx && ctx.platform) || '';
+      if (platform === 'chatgpt') {
+        cap = await captureChatgptMoment();
+      } else {
+        cap = await captureNow();
+      }
       // If we got a capture:
       if (cap) {
         // Add it to the note that was open when the user clicked.
@@ -1017,7 +1229,9 @@ import * as ls from '../local-storage.js';
         }
       } else {
         // Otherwise tell the user why nothing appeared.
-        setStatus('Couldn\u2019t capture \u2014 no playable video found in this tab.');
+        setStatus(platform === 'chatgpt'
+          ? 'Couldn\u2019t capture the current page.'
+          : 'Couldn\u2019t capture \u2014 no playable video found in this tab.');
         // Clear the message after a few seconds.
         setTimeout(() => setStatus(''), 4000);
       }
@@ -1044,12 +1258,17 @@ import * as ls from '../local-storage.js';
     });
   }
 
-  // Load the index of manual webpage screenshots from storage.
+  // Load the index of manual webpage screenshots from storage. Any shots the
+  // browser storage knows about are also bridged into the shared filesystem
+  // index (best-effort), so the Web Store and local installations can discover
+  // the same manual screenshots.
   async function loadManualShots() {
     // Read the stored index.
     const data = await storage.get(SHOTS_KEY);
     // Use the stored list, or an empty list if there's none.
     manualShots = (data && Array.isArray(data)) ? data : [];
+    // Bridge any browser-only shots into the shared on-disk index.
+    await ls.saveManualShotsIndex(manualShots);
   }
 
   // Load an image and resolve when its pixels are ready.
@@ -1068,19 +1287,24 @@ import * as ls from '../local-storage.js';
   }
 
   // Crop the captured tab image down to the selected rectangle. The captured
-  // image is in device pixels (devicePixelRatio x zoom are baked in), while
-  // the selection rectangle is in CSS viewport pixels, so the scale factor is
-  // capturedImagePixelWidth / hostViewportCssWidth.
+  // image is in device pixels (browser zoom and display DPR are baked into the
+  // bitmap), while the rectangle is in CSS viewport pixels. We therefore derive
+  // the REAL scale from the image itself - capturedImageWidth / hostViewportCssWidth
+  // (and height, separately) - never assume a devicePixelRatio value, so the
+  // crop lines up at every zoom level. Everything is clamped to the bitmap.
   async function cropCapturedImage(dataUrl, rect, viewport) {
     // Decode the full captured image.
     const img = await loadImage(dataUrl);
-    // How many image pixels cover one CSS pixel on the host page.
-    const scale = (viewport && viewport.width) ? img.naturalWidth / viewport.width : 1;
-    // Convert the rectangle into image coordinates, clamped to the image.
-    const sx = Math.max(0, Math.round(rect.x * scale));
-    const sy = Math.max(0, Math.round(rect.y * scale));
-    const sw = Math.min(img.naturalWidth - sx, Math.round(rect.width * scale));
-    const sh = Math.min(img.naturalHeight - sy, Math.round(rect.height * scale));
+    // How many image pixels cover one CSS pixel on the host page, per axis.
+    const scaleX = (viewport && viewport.width) ? img.naturalWidth / viewport.width : 1;
+    const scaleY = (viewport && viewport.height) ? img.naturalHeight / viewport.height : 1;
+    // Map the rectangle into image coordinates, clamped to the image.
+    const x1 = Math.max(0, Math.round(rect.x * scaleX));
+    const y1 = Math.max(0, Math.round(rect.y * scaleY));
+    const x2 = Math.min(img.naturalWidth, Math.max(x1, Math.round((rect.x + rect.width) * scaleX)));
+    const y2 = Math.min(img.naturalHeight, Math.max(y1, Math.round((rect.y + rect.height) * scaleY)));
+    const sw = x2 - x1;
+    const sh = y2 - y1;
     // A zero-sized crop (shouldn't happen, but guard anyway) is "no image".
     if (sw <= 0 || sh <= 0) return null;
 
@@ -1089,7 +1313,7 @@ import * as ls from '../local-storage.js';
     canvas.width = sw;
     canvas.height = sh;
     const ctx = canvas.getContext('2d');
-    ctx.drawImage(img, sx, sy, sw, sh, 0, 0, sw, sh);
+    ctx.drawImage(img, x1, y1, sw, sh, 0, 0, sw, sh);
     const out = canvas.toDataURL('image/jpeg', 0.92);
     // Only hand back a real image.
     return typeof out === 'string' && out.startsWith('data:image/') ? out : null;
@@ -1129,13 +1353,202 @@ import * as ls from '../local-storage.js';
     }
   }
 
-  // Run the full screenshot flow: capture -> select on the frozen frame ->
-  // crop -> Moment.
-  // ORDER MATTERS: the visible tab is captured FIRST, before any selection
-  // overlay exists, so the frozen background and the saved crop both come from
-  // the exact frame the user saw when they clicked Screenshot. The selection
-  // layer shown afterwards is a static copy of that capture; the live page can
-  // keep animating underneath but is never visible and never part of the image.
+  // ----------------------- Visible-tab capture shared helpers -----------------------
+
+  // Chrome asks once for the optional <all_urls> grant the first time a page
+  // screenshot is taken. A declined grant simply aborts with a hint - nothing
+  // is captured. Shared by the selection screenshot flow and the video-less
+  // platform "Capture" path.
+  async function ensureCapturePermission() {
+    try {
+      const granted = await chrome.permissions.contains({ origins: ['<all_urls>'] });
+      if (!granted) {
+        return await chrome.permissions.request({ origins: ['<all_urls>'] });
+      }
+      return true;
+    } catch (e) {
+      return false;
+    }
+  }
+
+  // The tab that hosts THIS sidebar, brought to the front of its window so a
+  // captureVisibleTab shoots OUR page (it only ever captures the ACTIVE tab of
+  // a window). Returns { tab } with the active tab, or { tab: null } - with
+  // activateFailed:true only when the tab existed but could not be brought
+  // forward, so callers can show the precise error message.
+  async function bringOwnTabToFront() {
+    const tabId = await getOwnTabId();
+    if (!tabId) return { tab: null, activateFailed: false };
+    let tab = null;
+    try {
+      tab = await chrome.tabs.get(tabId);
+    } catch (e) {
+      tab = null;
+    }
+    if (!tab) return { tab: null, activateFailed: false };
+    if (!tab.active) {
+      try {
+        await chrome.tabs.update(tabId, { active: true });
+        await new Promise((r) => setTimeout(r, 180));
+        tab = await chrome.tabs.get(tabId);
+      } catch (e) {
+        tab = null;
+      }
+      if (!tab || !tab.active) return { tab: null, activateFailed: true };
+    }
+    return { tab, activateFailed: false };
+  }
+
+  // Captured-frame diagnostics. Switched OFF once the blank-frame regression is
+  // confirmed fixed on-device (kept ON now per the on-screen trace requirement):
+  // every capture prints its stage + measured sizes so any future blank frame is
+  // pinpointed in seconds instead of re-debugged from scratch.
+  const CAPTURE_TRACE = true;
+
+  // Decode a captured frame purely to prove it has REAL pixels. A blank screen
+  // composited by the browser still decodes cleanly - only a missing, empty or
+  // corrupt bitmap yields zero size, and that is the definitive "the capture
+  // actually failed" signal the flows validate against before cropping/saving.
+  async function probeCaptureImage(dataUrl) {
+    try {
+      const img = await loadImage(dataUrl);
+      return { width: img.naturalWidth || 0, height: img.naturalHeight || 0 };
+    } catch (e) {
+      return { width: 0, height: 0 };
+    }
+  }
+
+  // Capture the visible frame of the given tab. Never throws: reports whether
+  // captureVisibleTab itself threw (permission/tab not capturable) versus
+  // returning an invalid frame, so callers can explain the failure.
+  async function captureVisibleFrame(tab) {
+    let dataUrl = null;
+    let threw = false;
+    try {
+      dataUrl = await chrome.tabs.captureVisibleTab(
+        tab.windowId, { format: 'jpeg', quality: 92 });
+    } catch (e) {
+      threw = true;
+    }
+    return {
+      threw,
+      dataUrl: (typeof dataUrl === 'string' && /^data:image\//.test(dataUrl)) ? dataUrl : null
+    };
+  }
+
+  // Video-less platform (ChatGPT) "+ Capture": save what is currently visible
+  // in the ChatGPT window as a moment. The visible tab is captured by the
+  // extension (content scripts cannot call chrome.tabs.captureVisibleTab) and
+  // the frame is saved EXACTLY as-is - ClipNote sidebar included. Nothing is
+  // hidden, removed, cropped or re-laid-out, so the sidebar stays mounted and
+  // stable and the saved image is exactly what the user sees. The moment is
+  // genuinely TIMESTAMP-FREE: no video position, no duration, no seek, and no
+  // captured wall-clock time. ChatGPT content = screenshot + note + conversation
+  // info. Returns a capture object in the same shape "+ Capture" produces,
+  // or null.
+  async function captureChatgptMoment() {
+    try {
+      // The same one-time <all_urls> grant every page capture needs.
+      if (!(await ensureCapturePermission())) {
+        setStatus('Screenshot needs one-time permission \u2014 approve it in the prompt, or in the extension\u2019s details page.');
+        setTimeout(() => setStatus(''), 5000);
+        return null;
+      }
+
+      // Shoot OUR tab, brought to the front for captureVisibleTab.
+      const ownTab = await bringOwnTabToFront();
+      if (!ownTab.tab) {
+        setStatus('Couldn\u2019t connect to this page. Please reload it.');
+        setTimeout(() => setStatus(''), 4000);
+        return null;
+      }
+      const tab = ownTab.tab;
+
+      // Where does the on-page CONTENT area sit? For ChatGPT the content script
+      // answers with the conversation region - an authoritative, stable
+      // rectangle - so the saved image is just that region, never the whole
+      // viewport and never the ClipNote sidebar. Queried BEFORE the shot,
+      // against the SAME layout the frame is taken in, so the crop that follows
+      // is pixel-accurate. Video platforms have no such rectangle and return
+      // null here; this function is only ever used by the ChatGPT "+ Capture"
+      // flow, and takeScreenshot() does NOT go through this code path.
+      const shotPlan = await getScreenshotTarget();
+      const planRect = resolveCaptureRect(shotPlan);
+
+      const frame = await captureVisibleFrame(tab);
+      if (frame.threw) {
+        setStatus('Capture failed \u2014 check that this tab is capturable.');
+        setTimeout(() => setStatus(''), 4000);
+        return null;
+      }
+      if (!frame.dataUrl) {
+        setStatus('Capture failed \u2014 the captured frame was invalid.');
+        setTimeout(() => setStatus(''), 4000);
+        return null;
+      }
+      // The bitmap must PROVE it has real pixels before anything is cropped.
+      const dataUrl = frame.dataUrl;
+      const probe = await probeCaptureImage(dataUrl);
+      if (CAPTURE_TRACE) {
+        console.warn('[CN-CAP] +Capture START platform=chatgpt frame='
+          + probe.width + 'x' + probe.height + ' bytes=' + dataUrl.length);
+      }
+      if (!probe.width || !probe.height) {
+        setStatus('Capture failed \u2014 the captured frame was blank.');
+        setTimeout(() => setStatus(''), 4000);
+        return null;
+      }
+
+      // Crop the full viewport frame down to the ChatGPT conversation region
+      // (the plan's content target). The ClipNote sidebar never appears in the
+      // saved image because the conversation rectangle sits where the sidebar
+      // is not. A missing rectangle keeps the full frame (defensive fallback).
+      let contentUrl = dataUrl;
+      if (planRect) {
+        contentUrl = await cropCapturedImage(
+          frame.dataUrl,
+          planRect,
+          planRect.viewport
+        );
+        if (!contentUrl) contentUrl = dataUrl;
+      }
+      if (CAPTURE_TRACE) {
+        const chk = await probeCaptureImage(contentUrl);
+        console.warn('[CN-CAP] +Capture RESULT='
+          + (planRect ? JSON.stringify(planRect) : 'full-frame-fallback')
+          + ' -> ' + chk.width + 'x' + chk.height + ' bytes=' + contentUrl.length);
+      }
+
+      // Snapshot the page's context at capture time so the moment remembers
+      // which conversation it came from. No time is recorded anywhere: a
+      // ChatGPT moment carries only the capture, the note and the conversation.
+      const ctx = await getVideoContext();
+      return {
+        id: uuid(),
+        screenshot: { type: 'data-url', dataUrl: contentUrl },
+        annotation: '',
+        platform: (ctx && ctx.platform) || 'chatgpt',
+        videoId: (ctx && (ctx.videoId || ctx.conversationId)) || '',
+        videoUrl: (ctx && ctx.videoUrl) || ''
+      };
+    } catch (e) {
+      return null;
+    }
+  }
+
+  // Run the full screenshot flow: capture the visible tab EXACTLY as-is ->
+  // freeze it -> confirm the WHOLE frame (plain click) or crop a region (drag)
+  // -> Moment.
+  // ORDER MATTERS (this is the SHARED pipeline for every platform): the visible
+  // tab is captured FIRST, exactly as the user sees it - ClipNote sidebar, AND
+  // all. The sidebar is never hidden, cropped, removed, repositioned or resized
+  // for a capture (hiding live page content first is exactly how a capture
+  // comes back blank), so the captured frame is a truthful snapshot of the
+  // screen. The frozen selection layer that follows is a static copy of that
+  // capture: a plain click saves the ENTIRE visible frame (ClipNote included)
+  // and a drag crops it - always a straight crop of the visible tab, never a
+  // re-composition. The live page can keep animating underneath but is never
+  // visible and never part of the image.
   async function takeScreenshot() {
     // Ignore the click if a capture or selection is already running.
     if (capturing) return;
@@ -1148,20 +1561,6 @@ import * as ls from '../local-storage.js';
     // Lock the capture buttons for the whole flow (blocks double-trigger).
     setCapturing(true);
 
-    // Hide/restore our OWN page sidebar around the frame capture, so the
-    // ClipNote UI itself never appears inside a page screenshot (the panel
-    // used to be captured along with the page). These helpers are function-
-    // scoped so the outer finally can guarantee a restore on EVERY exit path,
-    // never leaving the page minus its sidebar.
-    const hideSidebarForCapture = async () => {
-      await sendToContentScript({ type: 'CN_HOST_VISIBILITY', visible: false });
-      // Give the page a frame with the container gone before shooting.
-      await new Promise((r) => setTimeout(r, 150));
-    };
-    const restoreSidebar = async () => {
-      await sendToContentScript({ type: 'CN_HOST_VISIBILITY', visible: true });
-    };
-
     try {
       // 0) Page screenshots need the captureVisibleTab permission. It is
       //    requested LAZILY the first time, as an OPTIONAL (<all_urls>) grant:
@@ -1170,16 +1569,7 @@ import * as ls from '../local-storage.js';
       //    once. Requested at the very start of the flow (closest to the user
       //    gesture) and before any other page work, so the prompt can appear.
       //    A declined grant simply aborts with a hint - nothing is captured.
-      let canCapture = true;
-      try {
-        const granted = await chrome.permissions.contains({ origins: ['<all_urls>'] });
-        if (!granted) {
-          canCapture = await chrome.permissions.request({ origins: ['<all_urls>'] });
-        }
-      } catch (e) {
-        canCapture = false;
-      }
-      if (!canCapture) {
+      if (!(await ensureCapturePermission())) {
         setStatus('Screenshot needs one-time permission \u2014 approve it in the prompt, or in the extension\u2019s details page.');
         setTimeout(() => setStatus(''), 5000);
         return;
@@ -1190,86 +1580,70 @@ import * as ls from '../local-storage.js';
       //    on. captureVisibleTab only captures the ACTIVE tab of a window, so
       //    when this sidebar lives in a background tab it is brought to the
       //    front first - never the wrong (active) tab's page.
-      const tabId = await getOwnTabId();
-      if (!tabId) {
-        setStatus('Couldn\u2019t connect to this page. Please reload it.');
+      const ownTab = await bringOwnTabToFront();
+      if (!ownTab.tab) {
+        setStatus(ownTab.activateFailed
+          ? 'Couldn\u2019t bring this page to the front for the screenshot.'
+          : 'Couldn\u2019t connect to this page. Please reload it.');
         setTimeout(() => setStatus(''), 4000);
         return;
       }
-      let tab = null;
-      try {
-        tab = await chrome.tabs.get(tabId);
-      } catch (e) {
-        tab = null;
-      }
-      if (!tab) {
-        setStatus('Couldn\u2019t connect to this page. Please reload it.');
-        setTimeout(() => setStatus(''), 4000);
-        return;
-      }
-      if (!tab.active) {
-        try {
-          // Bring our own tab to the front of its window, then re-read it.
-          await chrome.tabs.update(tabId, { active: true });
-          await new Promise((r) => setTimeout(r, 180));
-          tab = await chrome.tabs.get(tabId);
-        } catch (e) {
-          tab = null;
-        }
-        if (!tab || !tab.active) {
-          setStatus('Couldn\u2019t bring this page to the front for the screenshot.');
-          setTimeout(() => setStatus(''), 4000);
-          return;
-        }
-      }
-      // 1b) Hide our OWN sidebar in the page before the frame is captured, so the
-      //     frame never contains it. The restore is issued right after the
-      //     frame is safely in hand (BEFORE the selection overlay is drawn) and
-      //     repeated in the outer finally as a safety net.
-      try {
-        await hideSidebarForCapture();
-      } catch (e) { /* a failed hide must never block the screenshot */ }
+      const tab = ownTab.tab;
 
-      let dataUrl = null;
-      try {
-        dataUrl = await chrome.tabs.captureVisibleTab(
-          tab.windowId, { format: 'jpeg', quality: 92 });
-      } catch (e) {
+      const frame = await captureVisibleFrame(tab);
+      if (frame.threw) {
         // captureVisibleTab threw (no permission, tab not capturable). Without
         // a real frame we refuse to enter selection mode or fake a screenshot.
-        await restoreSidebar();
         setStatus('Screenshot failed \u2014 check that this tab is capturable.');
         setTimeout(() => setStatus(''), 4000);
         return;
       }
-      if (typeof dataUrl !== 'string' || !/^data:image\//.test(dataUrl)) {
+      // The frame must be there AND prove it has real pixels before anything
+      // else: blank/empty bitmaps are refused loudly instead of being saved
+      // silently as a blank "screenshot".
+      if (!frame.dataUrl) {
         // The captured frame was invalid: abort cleanly, page stays untouched.
-        await restoreSidebar();
         setStatus('Screenshot failed \u2014 the captured frame was invalid.');
         setTimeout(() => setStatus(''), 4000);
         return;
       }
-      // The frame is safely in hand: restore the sidebar BEFORE selection mode
-      // so the user keeps the whole UI while dragging the crop rectangle.
-      await restoreSidebar();
-
-      // Keep the ORIGINAL frame for the final crop, but carry only a resized
-      // copy across to the content script for the frozen selection layer so
-      // the message never exceeds Chrome's size limit. The selection rectangle
-      // is reported in viewport CSS pixels regardless of image resolution, so
-      // cropping the original with its natural scale stays pixel-accurate.
-      const originalCapture = dataUrl;
-      const previewCapture = await resizeDataUrl(dataUrl, 1920, 0.82);
+      const frameProbe = await probeCaptureImage(frame.dataUrl);
+      if (CAPTURE_TRACE) {
+        console.warn('[CN-CAP] CAPTURE START frame='
+          + frameProbe.width + 'x' + frameProbe.height
+          + ' bytes=' + frame.dataUrl.length);
+      }
+      if (!frameProbe.width || !frameProbe.height) {
+        setStatus('Screenshot failed \u2014 the captured frame was blank.');
+        setTimeout(() => setStatus(''), 4000);
+        return;
+      }
+      // Keep the ORIGINAL full-frame capture for the final crop, but carry only
+      // a resized copy across to the content script for the frozen selection
+      // layer so the message never exceeds Chrome's size limit. The selection
+      // rectangle is reported in viewport CSS pixels regardless of image
+      // resolution, so cropping the original with its natural scale stays
+      // pixel-accurate.
+      const originalCapture = frame.dataUrl;
+      // The frozen preview is the FULL frame - ClipNote sidebar included. The
+      // screenshot is never pre-narrowed to a content target and never stripped
+      // of the sidebar: what the user sees is exactly what the frozen layer
+      // shows and exactly what a plain click saves.
+      const previewCapture = await resizeDataUrl(originalCapture, 1920, 0.82);
       if (previewCapture.length > MAX_MESSAGE_LENGTH) {
         setStatus('Screenshot too large to transfer. Try zooming out first.');
         setTimeout(() => setStatus(''), 4000);
         return;
       }
 
-      // 2) Ask the content script to show a STATIC, frozen copy of that capture
-      //    and let the user drag a rectangle over it. The message stays open
-      //    until the drag completes or the user cancels.
-      const selRes = await sendToContentScript({ type: 'CN_SCREENSHOT_SELECT', dataUrl: previewCapture });
+      // 2) Ask the content script to show a STATIC, frozen copy of that capture.
+      //    A plain click saves the WHOLE visible frame (ClipNote included); a
+      //    drag crops to the selected region. The message stays open until the
+      //    user clicks, drags, or cancels.
+      const selRes = await sendToContentScript({
+        type: 'CN_SCREENSHOT_SELECT',
+        dataUrl: previewCapture
+      });
       // Silent cancel (Esc) or the content script dropped the message.
       if (!selRes) {
         setStatus('Screenshot cancelled');
@@ -1289,9 +1663,19 @@ import * as ls from '../local-storage.js';
         return;
       }
 
-      // 3) Crop the ORIGINAL capture (from step 1) to the selected rectangle.
+      // 3) Crop the ORIGINAL full-frame capture (from step 1) to the chosen
+      //    rectangle - the whole viewport for a plain click, the dragged region
+      //    otherwise. This is a straight crop of the visible tab: ClipNote is
+      //    part of the saved image whenever the user did not drag it out of the
+      //    region. The result is validated before saving.
       const cropped = await cropCapturedImage(originalCapture, selRes.rect, selRes.rect.viewport);
-      if (!cropped) {
+      const cropProbe = cropped ? await probeCaptureImage(cropped) : null;
+      if (CAPTURE_TRACE) {
+        console.warn('[CN-CAP] selection=' + JSON.stringify(selRes.rect)
+          + (cropProbe ? ' crop=' + cropProbe.width + 'x' + cropProbe.height : ' crop=null')
+          + (cropped ? ' bytes=' + cropped.length : ''));
+      }
+      if (!cropped || !cropProbe || !cropProbe.width || !cropProbe.height) {
         setStatus('Couldn\u2019t crop the screenshot.');
         setTimeout(() => setStatus(''), 4000);
         return;
@@ -1302,14 +1686,23 @@ import * as ls from '../local-storage.js';
       // reported position (never a fake 00:00). The Math.max/Number guard is
       // kept as defensive padding for malformed replies.
       const timestamp = Math.max(0, Math.floor(Number(selRes.timestamp) || 0));
+      // VIDEO platforms only: a ChatGPT moment is timestamp-free by definition
+      // (no video time, no wall-clock capture time), so it never carries the
+      // timestamp/humanTime fields at all.
+      const selIsChat = !platformHasVideo(selRes.platform || 'youtube');
 
       // 4) Build a capture object in the EXACT shape + Capture produces and push
       //    it through the same addCaptureToNote pipeline, so the selected region
-      //    renders as a normal Moment card (thumbnail, timestamp, note field).
+      //    renders as a normal Moment card (thumbnail, note field; timestamp
+      //    link on video platforms only).
       const cap = {
         id: uuid(),
-        timestamp,
-        humanTime: selRes.humanTime || formatTimestamp(timestamp),
+        ...(selIsChat
+          ? {}
+          : {
+              timestamp,
+              humanTime: selRes.humanTime || formatTimestamp(timestamp)
+            }),
         screenshot: { type: 'data-url', dataUrl: cropped },
         annotation: '',
         // The video snapshot reported by the content script at selection time.
@@ -1326,12 +1719,12 @@ import * as ls from '../local-storage.js';
     } catch (e) {
       // Capture or crop threw (e.g. no permission, invalid rectangle). No
       // moment was created, so nothing partial is left behind.
+      if (CAPTURE_TRACE) console.warn('[CN-CAP] screenshot failure:', e);
       setStatus('Screenshot failed \u2014 check that this tab is capturable.');
       setTimeout(() => setStatus(''), 4000);
     } finally {
-      // Safety net: whatever path was taken, the page sidebar must be back.
-      try { await restoreSidebar(); } catch (e) { /* best effort */ }
-      // Always re-enable the buttons.
+      // No sidebar hide/restore to unwind: the sidebar was never touched. Only
+      // re-enable the buttons.
       setCapturing(false);
     }
     // Redraw the moments list so the new card is visible immediately.
@@ -1533,7 +1926,9 @@ import * as ls from '../local-storage.js';
       return;
     }
     setStatus('');
-    openMomentPreview({ screenshot: s });
+    // Pass the SHOT itself (with its relativePath), so the preview resolves the
+    // folder file the same way a moment preview does - never a stale blob URL.
+    openMomentPreview(shot);
   }
 
   // ----------------------------------------------------------------
@@ -1586,11 +1981,17 @@ import * as ls from '../local-storage.js';
       // Style it as the card meta text.
       meta.className = 'cn-shot-meta';
       // The platform label.
-      const platformLabel = shot.platform === 'udemy' ? 'Udemy' : 'YouTube';
-      // The capture date, trimmed of seconds.
-      const when = shot.createdAt ? new Date(shot.createdAt).toLocaleString(undefined, {
-        month: 'short', day: 'numeric', year: 'numeric', hour: 'numeric', minute: 'numeric'
-      }) : '';
+      let platformLabel = 'YouTube';
+      if (shot.platform === 'udemy') platformLabel = 'Udemy';
+      else if (shot.platform === 'chatgpt') platformLabel = 'ChatGPT';
+      // The capture date, trimmed of seconds. ChatGPT shots are timestamp-free
+      // content, so their card shows the DATE only (no time-of-day); video
+      // platform shots keep the full wall-clock capture date.
+      const when = shot.createdAt
+        ? new Date(shot.createdAt).toLocaleString(undefined, shot.platform === 'chatgpt'
+          ? { month: 'short', day: 'numeric', year: 'numeric' }
+          : { month: 'short', day: 'numeric', year: 'numeric', hour: 'numeric', minute: 'numeric' })
+        : '';
       // A save-state hint when the folder write didn't happen.
       if (shot.saveState && shot.saveState !== 'saved' && shot.saveState !== 'pending') {
         meta.textContent = `${platformLabel} \u00B7 ${when} \u00B7 \u26A0 unsaved`;
@@ -1624,6 +2025,9 @@ import * as ls from '../local-storage.js';
       // Add the finished card to the list.
       shotList.appendChild(card);
     }
+    // Keep the manual-shots blob URLs alive for this view: never let the next
+    // renderMoments-sweep revoke a thumbnail the home screen still displays.
+    markVisibleBlobUrls(sorted.map((s) => s.relativePath || '').filter(Boolean));
   }
 
   // Remove a manual screenshot: IndexedDB image, folder file, and index.
@@ -1642,6 +2046,9 @@ import * as ls from '../local-storage.js';
     manualShots = manualShots.filter((s) => s.id !== shot.id);
     // Save the trimmed index.
     await storage.set({ [SHOTS_KEY]: stripShotData(manualShots) });
+    // Mirror the trimmed list into the shared on-disk index (best effort) so
+    // the other installation stops seeing the deleted shot too.
+    await ls.saveManualShotsIndex(manualShots);
     // Redraw the section.
     renderShots();
     // Surface a folder-save failure (BUG 4) instead of hiding it.
@@ -1833,7 +2240,57 @@ import * as ls from '../local-storage.js';
   }
 
   // Build the list of moment cards for the open note.
-  function renderMoments() {
+  // Resolve a displayable image for a moment AT RENDER TIME. The filesystem
+  // path is the cross-install authority; the in-memory screenshot reference
+  // (data/blob/remote) is only consulted when no file is reachable, and a
+  // stale blob URL is re-read from the path on demand (Fix: a moment whose
+  // object URL was swept or revoked always gets a working replacement, and a
+  // rebuilt note without any screenshot reference resolves lazily from disk).
+  // Returns { src, blobPath } or null - the caller then renders an explicit
+  // placeholder instead of a broken <img>.
+  async function resolveMomentScreenshot(moment) {
+    // The path into the shared folder, when the moment has one.
+    const path = (moment && moment.relativePath) || '';
+    // A recorded file always wins: re-read it when no live URL exists yet.
+    if (path) {
+      // Reuse the current object URL when it is still in the registry.
+      let url = (ls.safeGetBlobUrl && ls.safeGetBlobUrl(path)) || null;
+      // Otherwise read the file and mint a fresh object URL for it.
+      if (!url) url = await ls.readBlobUrl(path);
+      if (url) {
+        // Keep the moment's cache in step with the working URL.
+        moment.screenshot = { type: 'blob-url', url };
+        return { src: url, blobPath: path };
+      }
+      // The file is unreachable: fall through to any cached inline/remote data
+      // (the "file missing"/"no folder" warnings explain the gap to the user).
+    }
+    // The cached screenshot reference (never a broken blob URL: the registry
+    // check above already failed).
+    const s = moment && moment.screenshot;
+    if (s && s.type === 'data-url' && s.dataUrl) return { src: s.dataUrl, blobPath: '' };
+    if (s && s.type === 'remote-url' && s.url) return { src: s.url, blobPath: '' };
+    // Nothing renderable: an explicit "no image" placeholder is shown instead.
+    return null;
+  }
+
+  // Tell the blob-URL registry which relative paths are on screen right now,
+  // then sweep everything else. This keeps memory bounded WITHOUT ever
+  // revoking a URL a live <img> points at (Fix: cache eviction no longer
+  // breaks visible screenshots).
+  function markVisibleBlobUrls(paths) {
+    if (!ls.markBlobUrlsInUse || !ls.sweepBlobUrls) return;
+    ls.markBlobUrlsInUse(paths);
+    ls.sweepBlobUrls();
+  }
+
+  // Bumped on every render pass; a pass that discovers it has been superseded
+  // stops before touching the DOM (keeps async resolutions from interleaving).
+  let renderGeneration = 0;
+
+  async function renderMoments() {
+    // Claim this pass.
+    const gen = ++renderGeneration;
     // Get the open note.
     const note = getActiveNote();
     // Clear the list of cards.
@@ -1847,6 +2304,8 @@ import * as ls from '../local-storage.js';
       noMoments.classList.add('visible');
       // Hide the empty list.
       momentsList.classList.add('cn-hidden');
+      // Nothing is visible: release every cached object URL.
+      markVisibleBlobUrls([]);
       // Stop here.
       return;
     }
@@ -1862,6 +2321,16 @@ import * as ls from '../local-storage.js';
     // on-screen order always matches the stored order - after a rebuild or a
     // recovery the array order may not carry the user's chosen ordering.
     const ordered = momentsInDisplayOrder(note.moments);
+
+    // Resolve every visible image in parallel (files are read once, cached by
+    // the registry for later passes) BEFORE any DOM work.
+    const resolved = await Promise.all(
+      ordered.map((m) => resolveMomentScreenshot(m).catch(() => null))
+    );
+    // A newer render superseded this one: leave the DOM to the winner.
+    if (gen !== renderGeneration) return;
+    // Resolutions keyed by moment id for the card loop below.
+    const resById = new Map(ordered.map((m, i) => [m.id, resolved[i]]));
 
     // Loop over every moment to build a card.
     for (const moment of ordered) {
@@ -1887,33 +2356,32 @@ import * as ls from '../local-storage.js';
       const thumb = document.createElement('div');
       // Style it as the thumbnail area.
       thumb.className = 'cn-note-thumb';
-      // The image element inside it.
-      const img = document.createElement('img');
-      // No alt text (decorative image).
-      img.alt = '';
-      // If the moment has a screenshot:
-      if (moment.screenshot) {
-        // If it's an inline image, use that as the source.
-        if (moment.screenshot.type === 'data-url' && moment.screenshot.dataUrl) img.src = moment.screenshot.dataUrl;
-        // Otherwise use the remote image URL.
-        else if (moment.screenshot.type === 'remote-url' && moment.screenshot.url) img.src = moment.screenshot.url;
-        // Recovered moments point at the actual file in the folder.
-        else if (moment.screenshot.type === 'blob-url' && moment.screenshot.url) img.src = moment.screenshot.url;
-      }
-      // Remember whether a real image ended up in the thumbnail.
-      const hasImg = !!img.src;
-      // Put the image in the thumbnail box.
-      thumb.appendChild(img);
-      // A click on a real thumbnail opens the full-size preview (a fixed
-      // overlay inside the sidebar), so the click never reaches the host
-      // page's own viewer/overlay.
-      if (hasImg) {
+      // The resolved image for this moment (null when genuinely unavailable).
+      const res = resById.get(moment.id);
+      if (res && res.src) {
+        // A real image: create the element only now, so a src is ALWAYS set
+        // (a bare srcless <img> would render as a broken icon).
+        const img = document.createElement('img');
+        // No alt text (decorative image).
+        img.alt = '';
+        // The displayable source (inline, remote, or a live object URL).
+        img.src = res.src;
+        // Put the image in the thumbnail box.
+        thumb.appendChild(img);
         // Make the thumbnail look clickable.
         thumb.classList.add('cn-note-thumb-clickable');
         // Tooltip explaining the action.
         thumb.title = 'View full image';
         // When clicked, show the ClipNote preview.
         thumb.addEventListener('click', () => openMomentPreview(moment));
+      } else {
+        // Explicit no-image state: readable text, never a broken image glyph.
+        thumb.classList.add('cn-note-thumb-empty');
+        // Explain which case it is: a file that should exist but cannot be read
+        // versus a moment that never captured an image.
+        thumb.textContent = moment.relativePath ? 'Screenshot unavailable' : 'No image';
+        // An accessible label for the placeholder.
+        thumb.setAttribute('aria-label', moment.relativePath ? 'Screenshot unavailable' : 'No image');
       }
 
       // The right-hand content column.
@@ -1926,54 +2394,61 @@ import * as ls from '../local-storage.js';
       // Style it as the note top row.
       top.className = 'cn-note-top';
 
-      // The clickable timestamp label.
-      const timeLink = document.createElement('span');
-      // Style it as the time link.
-      timeLink.className = 'cn-note-time';
-      // Show the friendly time, or "Ns" as a fallback.
-      timeLink.textContent = moment.humanTime || `${Math.floor(moment.timestamp)}s`;
-      // Tooltip explaining the click action.
-      timeLink.title = 'Jump to timestamp';
-      // When clicked, use the moment's own stored video source as the authority.
-      // If that video is the one currently open, preserve the in-page seek;
-      // otherwise open the moment's stored URL (never the current page's URL).
-      timeLink.addEventListener('click', () => {
-        const url = momentWatchUrl(moment, note);
-        if (!url) {
-          // Legacy moment with no trustworthy URL: keep the old seek behaviour.
-          seekTo(moment.timestamp);
-          return;
-        }
-        const mine = momentVideoIdentity(moment, note);
-        getVideoContext().then(async (ctx) => {
-          const currentPlatform = (ctx && ctx.platform) || '';
-          const currentVideoId = (ctx && (ctx.videoId || ctx.lectureId)) || '';
-          const sameVideo = !!currentPlatform && !!currentVideoId &&
-            currentPlatform === mine.platform && currentVideoId === mine.videoId;
-          if (sameVideo) {
-            // The moment belongs to the video on screen: seek in place.
+      // VIDEO PLATFORMS only (YouTube & Udemy): the clickable timestamp label.
+      // ChatGPT is not a video platform, so it never shows a timestamp, seek
+      // control, "Jump to timestamp" link or any fake time - a ChatGPT capture
+      // simply means "what is visible on screen right now".
+      if (platformHasVideo(note.platform)) {
+        // The clickable timestamp label.
+        const timeLink = document.createElement('span');
+        // Style it as the time link.
+        timeLink.className = 'cn-note-time';
+        // Show the friendly time, or "Ns" as a fallback.
+        timeLink.textContent = moment.humanTime || `${Math.floor(moment.timestamp)}s`;
+        // Tooltip explaining the click action.
+        timeLink.title = 'Jump to timestamp';
+        // When clicked, use the moment's own stored video source as the authority.
+        // If that video is the one currently open, preserve the in-page seek;
+        // otherwise open the moment's stored URL (never the current page's URL).
+        timeLink.addEventListener('click', () => {
+          const url = momentWatchUrl(moment, note);
+          if (!url) {
+            // Legacy moment with no trustworthy URL: keep the old seek behaviour.
             seekTo(moment.timestamp);
-          } else {
-            // A different (or unknown) video: open the moment's own URL.
-            // Udemy URLs cannot carry a timestamp, so hand the newly opened
-            // lecture a one-shot seek request the content script consumes
-            // once the page's video is available.
-            if (mine.platform === 'udemy' && mine.videoId) {
-              try {
-                await storage.set({
-                  [PENDING_SEEK_KEY]: {
-                    platform: 'udemy',
-                    lectureId: String(mine.videoId),
-                    timestamp: moment.timestamp || 0,
-                    createdAt: Date.now()
-                  }
-                });
-              } catch (e) { /* best effort; the lecture still opens */ }
-            }
-            window.open(url, '_blank', 'noopener,noreferrer');
+            return;
           }
+          const mine = momentVideoIdentity(moment, note);
+          getVideoContext().then(async (ctx) => {
+            const currentPlatform = (ctx && ctx.platform) || '';
+            const currentVideoId = (ctx && (ctx.videoId || ctx.lectureId)) || '';
+            const sameVideo = !!currentPlatform && !!currentVideoId &&
+              currentPlatform === mine.platform && currentVideoId === mine.videoId;
+            if (sameVideo) {
+              // The moment belongs to the video on screen: seek in place.
+              seekTo(moment.timestamp);
+            } else {
+              // A different (or unknown) video: open the moment's own URL.
+              // Udemy URLs cannot carry a timestamp, so hand the newly opened
+              // lecture a one-shot seek request the content script consumes
+              // once the page's video is available.
+              if (mine.platform === 'udemy' && mine.videoId) {
+                try {
+                  await storage.set({
+                    [PENDING_SEEK_KEY]: {
+                      platform: 'udemy',
+                      lectureId: String(mine.videoId),
+                      timestamp: moment.timestamp || 0,
+                      createdAt: Date.now()
+                    }
+                  });
+                } catch (e) { /* best effort; the lecture still opens */ }
+              }
+              window.open(url, '_blank', 'noopener,noreferrer');
+            }
+          });
         });
-      });
+        top.appendChild(timeLink);
+      }
 
       // The small delete button.
       const deleteBtn = document.createElement('button');
@@ -1985,9 +2460,6 @@ import * as ls from '../local-storage.js';
       deleteBtn.title = 'Delete';
       // When clicked, remove this moment.
       deleteBtn.addEventListener('click', () => deleteMoment(moment.id));
-
-      // Put the time and delete button in the top row.
-      top.appendChild(timeLink);
 
       // The save-state warning (added below) is shown under the textarea.
       // Delete button first:
@@ -2013,7 +2485,7 @@ import * as ls from '../local-storage.js';
         // Cancel any pending save.
         clearTimeout(saveTimer);
         // Save shortly after typing pauses. The write also refreshes the note's
-        // filesystem sidecar (v3) so the annotation survives a storage wipe -
+        // filesystem sidecar (v4) so the annotation survives a storage wipe -
         // but never for a note that has since been deleted (its folder must not
         // be recreated on disk by a stale save).
         saveTimer = setTimeout(async () => {
@@ -2044,6 +2516,26 @@ import * as ls from '../local-storage.js';
         // Its label.
         retry.textContent = 'Retry Save';
         // Retrying re-attempts the folder write.
+        retry.addEventListener('click', () => retrySaveMoment(note.id, moment.id));
+        // Add both to the status line.
+        statusRow.appendChild(warn);
+        statusRow.appendChild(retry);
+      } else if (moment.saveState === 'remote-unsaved') {
+        // A thumb/remote fallback could not be persisted to the folder (CORS or
+        // a missing folder). The moment still shows its remote image, but the
+        // library needs the file written to survive a storage wipe.
+        const warn = document.createElement('span');
+        // Style it as the warning.
+        warn.className = 'cn-warn';
+        // The message text.
+        warn.textContent = '\u26A0 Screenshot not saved to folder';
+        // The retry button.
+        const retry = document.createElement('button');
+        // Style it as a small action button.
+        retry.className = 'cn-status-btn';
+        // Its label.
+        retry.textContent = 'Retry Save';
+        // Retrying re-attempts the remote fetch + folder write.
         retry.addEventListener('click', () => retrySaveMoment(note.id, moment.id));
         // Add both to the status line.
         statusRow.appendChild(warn);
@@ -2129,6 +2621,12 @@ import * as ls from '../local-storage.js';
         }).catch(() => { /* ignore */ });
       }
     }
+
+    // Release every object URL that is no longer visible (keeps the cache
+    // bounded; live thumbnails are never revoked).
+    markVisibleBlobUrls(
+      ordered.map((m) => (resById.get(m.id) || {}).blobPath).filter(Boolean)
+    );
   }
 
   // ---------------- Moment image preview ----------------
@@ -2138,60 +2636,65 @@ import * as ls from '../local-storage.js';
 
   // Open a full-size preview of a moment's screenshot inside the sidebar.
   // This keeps the click inside the ClipNote iframe instead of letting it
-  // fall through to the host page.
+  // fall through to the host page. The image is resolved lazily (the folder
+  // file wins, exactly like the thumbnail render), so a preview never opens
+  // with a stale or revoked object URL.
   function openMomentPreview(moment) {
+    if (!moment) return;
     // Close any preview that is already open.
     closeMomentPreview();
-    // The screenshot data for this moment.
-    const s = moment && moment.screenshot;
-    // The image source (data URL, remote URL, or folder blob URL).
-    const src = s && ((s.type === 'data-url' && s.dataUrl) || s.url) || '';
-    // If there's no image, there is nothing to preview.
-    if (!src) return;
+    // Resolve the displayable source now (async; may hit the filesystem).
+    resolveMomentScreenshot(moment).then((res) => {
+      // A preview may have been closed (or re-opened) while resolving.
+      if (previewOverlay) return;
+      // No source means there is nothing to preview.
+      const src = (res && res.src) || '';
+      if (!src) return;
 
-    // The dimmed overlay that fills the sidebar iframe.
-    previewOverlay = document.createElement('div');
-    // Style it as the preview overlay.
-    previewOverlay.className = 'cn-preview-overlay';
-    // The full-size image.
-    const img = document.createElement('img');
-    // Style it as the preview image.
-    img.className = 'cn-preview-img';
-    // Show the source image.
-    img.src = src;
-    // Decorative image.
-    img.alt = '';
-    // The close button.
-    const close = document.createElement('button');
-    // Style it as the close button.
-    close.className = 'cn-preview-close';
-    // An X glyph.
-    close.textContent = '\u2715';
-    // Tooltip for the button.
-    close.title = 'Close';
-    // Attach the image and button to the overlay.
-    previewOverlay.appendChild(img);
-    previewOverlay.appendChild(close);
-    // Clicking the dimmed backdrop (not the image) also closes it.
-    previewOverlay.addEventListener('click', (e) => {
-      if (e.target === previewOverlay) closeMomentPreview();
-    });
-    // The X button closes it too.
-    close.addEventListener('click', (e) => {
-      // Stop the click reaching the backdrop handler.
-      e.stopPropagation();
-      closeMomentPreview();
-    });
-    // Closing with the Escape key.
-    const onKey = (e) => { if (e.key === 'Escape') closeMomentPreview(); };
-    // Remember the listener so we can remove it on close.
-    previewOverlay._onKey = onKey;
-    // Listen for Escape while the preview is open.
-    document.addEventListener('keydown', onKey);
-    // Add the overlay to the sidebar body.
-    document.body.appendChild(previewOverlay);
-    // Put the "focus" behind the overlay so it can't be interacted with.
-    document.body.style.overflow = 'hidden';
+      // The dimmed overlay that fills the sidebar iframe.
+      previewOverlay = document.createElement('div');
+      // Style it as the preview overlay.
+      previewOverlay.className = 'cn-preview-overlay';
+      // The full-size image.
+      const img = document.createElement('img');
+      // Style it as the preview image.
+      img.className = 'cn-preview-img';
+      // Show the source image.
+      img.src = src;
+      // Decorative image.
+      img.alt = '';
+      // The close button.
+      const close = document.createElement('button');
+      // Style it as the close button.
+      close.className = 'cn-preview-close';
+      // An X glyph.
+      close.textContent = '\u2715';
+      // Tooltip for the button.
+      close.title = 'Close';
+      // Attach the image and button to the overlay.
+      previewOverlay.appendChild(img);
+      previewOverlay.appendChild(close);
+      // Clicking the dimmed backdrop (not the image) also closes it.
+      previewOverlay.addEventListener('click', (e) => {
+        if (e.target === previewOverlay) closeMomentPreview();
+      });
+      // The X button closes it too.
+      close.addEventListener('click', (e) => {
+        // Stop the click reaching the backdrop handler.
+        e.stopPropagation();
+        closeMomentPreview();
+      });
+      // Closing with the Escape key.
+      const onKey = (e) => { if (e.key === 'Escape') closeMomentPreview(); };
+      // Remember the listener so we can remove it on close.
+      previewOverlay._onKey = onKey;
+      // Listen for Escape while the preview is open.
+      document.addEventListener('keydown', onKey);
+      // Add the overlay to the sidebar body.
+      document.body.appendChild(previewOverlay);
+      // Put the "focus" behind the overlay so it can't be interacted with.
+      document.body.style.overflow = 'hidden';
+    }).catch(() => { /* no image to show */ });
   }
 
   // Remove the preview overlay and its key listener.
@@ -2412,8 +2915,10 @@ import * as ls from '../local-storage.js';
     for (const mom of state.note.moments) momentsList.appendChild(byId.get(mom.id));
     // Animate each card into its final spot.
     animateCardsIntoPlace(cards, firstRects);
-    // Persist the new order (only metadata changes, not the files).
-    saveAllNotes();
+    // Persist the new order (only metadata changes, not the files), and mirror
+    // it into the note's filesystem sidecar so a storage wipe + rebuild keeps
+    // the reorder (the sidecar records sortOrder).
+    saveAllNotes().then(() => ls.saveNoteSidecar(state.note));
   }
 
   // Smoothly move cards into their final positions after a drop.
@@ -2555,6 +3060,9 @@ import * as ls from '../local-storage.js';
     } else if (platform === 'udemy') {
       // Udemy: use the lecture title, or fall back to the course title.
       title = ((ctx && ctx.lectureTitle) || (ctx && ctx.courseTitle) || '').trim() || 'New Note';
+    } else if (platform === 'chatgpt') {
+      // ChatGPT: use the conversation title.
+      title = ((ctx && ctx.conversationTitle) || (ctx && ctx.videoTitle) || '').trim() || 'New Note';
     }
 
     // Build the note object.
@@ -2660,8 +3168,8 @@ import * as ls from '../local-storage.js';
     // Build the HTML for every moment, in the SAME display order the list
     // uses. Blob previews are resolved from the saved file as the blocks are
     // built, so a stored moment's screenshot is never skipped; a moment whose
-    // image genuinely can't be resolved still prints its timestamp (+ note)
-    // instead of silently vanishing from the PDF.
+    // image genuinely can't be resolved still prints its note instead of
+    // silently vanishing from the PDF.
     const blocks = [];
     for (const m of momentsInDisplayOrder(note.moments)) {
       // The image HTML for this moment.
@@ -2684,25 +3192,14 @@ import * as ls from '../local-storage.js';
         } catch (e) { /* fall through: the moment still prints its text */ }
       }
 
-      // The friendly time text.
-      const timeStr = escapeHtml(m.humanTime || Math.floor(m.timestamp) + 's');
-      // The timestamp block: a clickable hyperlink pointing at THIS moment's
-      // video via momentWatchUrl() (which uses the stored videoUrl when one
-      // exists and safely reconstructs one for legacy Moments without it),
-      // otherwise the plain timestamp. The URL is strictly validated (http(s)
-      // only) so stored values can never inject executable markup or
-      // privileged links into the PDF.
-      const linkUrl = isSafeExternalUrl(momentWatchUrl(m, note));
-      const tsHtml = linkUrl
-        ? '<a class="pdf-timestamp" href="' + escapeHtml(linkUrl) + '">' + timeStr + '</a>'
-        : '<div class="pdf-timestamp">' + timeStr + '</div>';
-      // The annotation HTML, with or without text. Every user-provided field is
+      // The PDF prints the annotation TEXT only - the capture timestamp is
+      // intentionally NOT included for ANY platform. YouTube/Udemy timestamp
+      // links and ChatGPT time are equally omitted, so every exported Moment
+      // line is just the note the user wrote. Every user-provided field is
       // escaped so a note/annotation can never inject markup into the PDF.
       const annHtml = (m.annotation && m.annotation.trim())
-        // With a note: show time and the note.
-        ? tsHtml + '<div class="pdf-annotation">' + escapeHtml(m.annotation) + '</div>'
-        // Without a note: just the time.
-        : tsHtml;
+        ? '<div class="pdf-annotation">' + escapeHtml(m.annotation) + '</div>'
+        : '';
 
       // Combine everything into one moment block.
       blocks.push('<div class="moment">\n      <div class="moment-image">' + imgHtml + '</div>\n      <div class="moment-text">' + annHtml + '</div>\n    </div>');
@@ -2739,8 +3236,6 @@ import * as ls from '../local-storage.js';
   .moment:last-child { border-bottom: none; }
   .moment-image img { display: block; max-width: 100%; height: auto; border: 1px solid #ddd; border-radius: 6px; }
   .moment-text { display: flex; flex-direction: column; gap: 8px; }
-  .pdf-timestamp { font-size: 13px; font-weight: 700; color: #e07a5f; text-decoration: none; }
-  a.pdf-timestamp { text-decoration: none; color: #e07a5f; }
   .pdf-annotation { font-size: 14px; line-height: 1.6; white-space: pre-wrap; }
 </style></head>
 <body>
@@ -2853,11 +3348,42 @@ import * as ls from '../local-storage.js';
   async function init() {
     // Connect all the buttons.
     initEvents();
-    // When the browsing context that owns these object URLs is torn down,
-    // release every cached blob URL so nothing leaks for the tab's lifetime.
-    window.addEventListener('pagehide', () => {
+
+    // bfcache-aware lifecycle handling. The sidebar iframe frequently gets
+    // BFCACHE-restored (back/forward), and a restore keeps the blob URLs alive:
+    // pagehide must NOT revoke them when e.persisted is true, or the restored
+    // page renders broken thumbnails. On a genuine pagehide the browsing context
+    // is really going away, so every cached object URL is released.
+    window.addEventListener('pagehide', (e) => {
+      // A bfcache entry is being kept: leave the object URLs for the restore.
+      if (e && e.persisted) return;
+      // Genuine teardown: release everything.
       if (ls && typeof ls.revokeAllBlobUrls === 'function') ls.revokeAllBlobUrls();
-    }, { once: true });
+    });
+    // Returning from bfcache: our blob URLs are intact (we skipped the revoke),
+    // but re-run the current render so any on-disk changes are reflected too.
+    window.addEventListener('pageshow', (e) => {
+      // Only act when actually restored from the back/forward cache.
+      if (!(e && e.persisted)) return;
+      // Re-render whatever view is open.
+      if (getActiveNote()) renderMoments();
+      else showHomeView();
+    });
+
+    // React to EXTERNAL library changes (Storage page -> Rebuild Library):
+    // reload the notes in place so a running sidebar stays in sync instead of
+    // pretending nothing changed until its next manual reload. Our own saves
+    // are skipped via the storageWriteInFlight/bootstrapping guards.
+    chrome.storage.onChanged.addListener((changes, area) => {
+      if (area !== 'local' || !changes || !changes[NOTE_KEY]) return;
+      if (bootstrapping || storageWriteInFlight > 0) return;
+      // reloadNotesFromStorage() is SYNCHRONOUS - it only debounces the reload
+      // onto a timer and returns undefined. Chaining `.catch()` onto that used
+      // to throw a TypeError on every external rebuild (the DevTools error that
+      // once landed on this line); a plain guarded call keeps the UI alive.
+      try { reloadNotesFromStorage(); } catch (e) { /* keep the UI alive */ }
+    });
+
     // Carry any legacy data into the new keys FIRST, so the migration is part of
     // the data load that follows (a legacy note id can then reopen correctly
     // on first launch instead of being invisible to the fresh-load check).
@@ -2866,6 +3392,8 @@ import * as ls from '../local-storage.js';
     await loadAllNotes();
     // Load the saved manual webpage screenshots.
     await loadManualShots();
+    // Bootstrapping is done: external storage changes may reload from now on.
+    bootstrapping = false;
 
     // Tell the user when no screenshot folder is connected (captures still
     // work - the originals just can't be written out until one is set).
