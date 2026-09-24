@@ -77,6 +77,12 @@
       // contentScript.js after navigation) locates the freshly rendered
       // sidebar container and moves the sidebar into it.
     }
+
+    // Full teardown when the extension context is invalidated. The Udemy copy
+    // registers no global listeners, so this mirrors the layout restore.
+    destroy() {
+      U.layout.destroy();
+    }
   }
 
   NS.adapters.push(new UdemyAdapter());

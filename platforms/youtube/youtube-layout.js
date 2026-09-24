@@ -235,12 +235,34 @@
     // (breakpoint changes, SPA navigation), so the container re-anchors.
     refresh: function () {
       schedule();
+    },
+
+    // Full teardown for when the extension context is invalidated: drop the
+    // global resize watcher and the observer so a takeover copy never inherits
+    // this copy's events, then restore the page to byte-for-byte clean.
+    destroy: function () {
+      if (rafId) {
+        cancelAnimationFrame(rafId);
+        rafId = null;
+      }
+      window.removeEventListener('resize', onResize);
+      if (state && state.observer) {
+        state.observer.disconnect();
+        state.observer = null;
+      }
+      if (state && state.container && state.container.parentElement) {
+        state.container.remove();
+      }
+      removeStyle();
+      state = null;
     }
   };
 
   // One global listener per tab: kept alive by the guarded module flag, so a
-  // popup re-injection can never register it twice.
-  window.addEventListener('resize', schedule);
+  // popup re-injection can never register it twice. Bound to a named function
+  // so destroy() can remove exactly this registration on shutdown.
+  const onResize = () => schedule();
+  window.addEventListener('resize', onResize);
 
   Y.__layoutLoaded = true;
 })();

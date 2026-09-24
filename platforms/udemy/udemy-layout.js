@@ -207,6 +207,13 @@
       }
       removeStyle();
       state = null;
+    },
+
+    // Full teardown for when the extension context is invalidated. Udemy's
+    // layout module registers no global listeners, so destroying it is exactly
+    // restoring the page to clean.
+    destroy: function () {
+      U.layout.restoreLayout();
     }
   };
 

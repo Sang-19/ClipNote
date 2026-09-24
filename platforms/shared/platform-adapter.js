@@ -69,6 +69,11 @@
 
     // Notification that the page just navigated; refresh platform state.
     handleNavigation() {}
+
+    // Full teardown, run when the extension context is invalidated (reload /
+    // update) so a takeover copy never inherits this copy's listeners,
+    // ResizeObservers or timers. Optional - implementations can ignore it.
+    destroy() {}
   };
 
   NS.__sharedLoaded = true;

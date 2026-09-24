@@ -89,6 +89,14 @@
       Y.navigation.setup(handleNavigation);
     }
 
+    // Full teardown when the extension context is invalidated: unhook the
+    // SPA navigation listener and the global resize watcher so a fresh copy
+    // taking over this page never inherits a stale copy's listeners.
+    destroy() {
+      Y.layout.destroy();
+      Y.navigation.teardown();
+    }
+
     handleNavigation() {
       // The stale #secondary-inner from the previous video is dead; the next
       // applyLayout() call (issued by contentScript.js) will locate the fresh

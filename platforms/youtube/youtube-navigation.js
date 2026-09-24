@@ -14,10 +14,25 @@
   const Y = NS.youtube;
   if (Y.__navigationLoaded) return;
 
+  // The exact listener this module registered, so teardown() can remove the
+  // very same function reference when the extension context is invalidated.
+  let navHandler = null;
+
   Y.navigation = {
     // YouTube fires this after it swaps in a new page in place.
     setup: function (handleNavigation) {
-      window.addEventListener('yt-navigate-finish', handleNavigation);
+      // Remember the precise listener we add: a fresh copy taking over after
+      // an extension reload must be able to remove ours and add its own.
+      navHandler = handleNavigation;
+      window.addEventListener('yt-navigate-finish', navHandler);
+    },
+    // Unhook the navigation listener. Called on shutdown of an invalidated
+    // context; idempotent (nothing registered means nothing to remove).
+    teardown: function () {
+      if (navHandler) {
+        window.removeEventListener('yt-navigate-finish', navHandler);
+        navHandler = null;
+      }
     }
   };
 

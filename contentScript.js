@@ -115,6 +115,12 @@
     } else if (sidebarContainer && sidebarContainer.isConnected) {
       try { sidebarContainer.remove(); } catch (e) { /* best effort */ }
     }
+    // Fully destroy the platform hooks this copy registered (navigation
+    // listener, ResizeObservers, global resize watcher) so a fresh copy that
+    // takes over this page never inherits a stale copy's listeners.
+    if (adapter && typeof adapter.destroy === 'function') {
+      try { adapter.destroy(); } catch (e) { /* best effort */ }
+    }
     document.querySelectorAll('#cn-sidebar-container').forEach((el) => el.remove());
     sidebarContainer = null;
     // Drop the video binding and the navigation wiring it installed.
@@ -138,6 +144,15 @@
 
   // Keep track of a fixed number of milliseconds.
   const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+
+  // chrome.storage key for a one-shot "seek this lecture when it loads"
+  // request. Written by the sidebar when the user clicks a Moment whose Udemy
+  // lecture is not the one currently open (Udemy URLs cannot carry a timestamp
+  // parameter, so the freshly opened lecture is told to seek through storage).
+  const PENDING_SEEK_KEY = 'clipnote_pending_seek';
+  // A pending seek is only honoured for a short window; a stale request must
+  // never seek into some later lecture the user happens to open.
+  const PENDING_SEEK_MAX_AGE = 10 * 60 * 1000;
 
   // True once the user has turned the extension on.
   let cnEnabled = false;
@@ -230,6 +245,71 @@
     return (Number.isFinite(t) && t >= 0) ? Math.floor(t) : null;
   }
 
+  // Build the canonical URL to store on a Moment, from the video-context
+  // snapshot taken when the capture began. YouTube moments get a canonical
+  // watch URL (`watch?v=<id>&t=<seconds>s`) so a later timestamp click always
+  // opens the exact video at the exact time - never a temporary page URL with
+  // unrelated parameters. Any other platform keeps the snapshot's own source
+  // URL when that is a real http(s) URL. Nothing is ever guessed or invented.
+  function buildMomentVideoUrl(context, seconds) {
+    const platform = (context && context.platform) || (adapter && adapter.platform) || '';
+    const videoId = context && context.videoId;
+    // Only YouTube has a canonical timestamped URL for this feature.
+    if (platform === 'youtube' && videoId) {
+      const secs = Math.max(0, Math.floor(seconds || 0));
+      const base = 'https://www.youtube.com/watch?v=' + encodeURIComponent(videoId);
+      return secs > 0 ? base + '&t=' + secs + 's' : base;
+    }
+    // Udemy (and anything else): keep the snapshot's real source page.
+    const src = context && context.videoUrl;
+    return (typeof src === 'string' && /^https?:\/\//.test(src)) ? src : '';
+  }
+
+  // Honour a one-shot "seek when this source loads" request written by the
+  // sidebar. Only a request that matches the CURRENT page's platform + lecture
+  // is applied, then immediately cleared; anything else (or too old) is left
+  // alone or dropped so it can never seek into the wrong video. Provides the
+  // Udemy half of "open the stored lecture, then seek to the stored timestamp
+  // when the video becomes available" - YouTube needs none of this because its
+  // `t=<seconds>s` URL parameter is handled natively by the player.
+  async function consumePendingSeek() {
+    try {
+      const pending = await getSetting(PENDING_SEEK_KEY);
+      if (!pending || typeof pending !== 'object') return;
+      // The request went stale: never seek into whatever the user opened later.
+      if (pending.createdAt && Date.now() - pending.createdAt > PENDING_SEEK_MAX_AGE) {
+        try { chrome.storage.local.remove(PENDING_SEEK_KEY); } catch (e) { /* ignore */ }
+        return;
+      }
+      const ctx = getVideoContext();
+      const platform = (ctx && ctx.platform) || '';
+      const currentId = platform === 'udemy' ? ((ctx && ctx.lectureId) || '') : ((ctx && ctx.videoId) || '');
+      // Not the source this request was meant for: stay untouched.
+      if (platform !== pending.platform || !currentId ||
+          currentId !== ((pending.lectureId || pending.videoId) || '')) return;
+
+      // The page matches the pending moment's source: wait for its video bound
+      // (bounded), then seek and clear. A Stale video cannot swallow a retry.
+      const start = Date.now();
+      while (Date.now() - start < 8000) {
+        if (!isContextValid()) return;
+        const el = (videoEl && videoEl.isConnected) ? videoEl : await ensureVideo();
+        if (el && el.isConnected) {
+          let seconds = Number(pending.timestamp);
+          if (!Number.isFinite(seconds) || seconds < 0) seconds = 0;
+          const duration = el.duration;
+          if (Number.isFinite(duration) && duration > 0 && seconds > duration) seconds = duration;
+          try { el.currentTime = seconds; el.play().catch(() => {}); } catch (e) { /* ignore */ }
+          try { chrome.storage.local.remove(PENDING_SEEK_KEY); } catch (e) { /* ignore */ }
+          return;
+        }
+        await sleep(500);
+      }
+    } catch (e) {
+      // Best effort only: seeking-after-open must never crash page init.
+    }
+  }
+
   // ----------------------- Video -----------------------
 
   // Generic video discovery: biggest visible <video>, else most-ready <video>.
@@ -275,17 +355,21 @@
     return videoEl;
   }
 
-  // Wait until the video finishes moving to a new position.
-  function waitForSeek() {
+  // Wait until the video finishes moving to a new position. The element this
+  // is waiting on is passed in as a LOCAL reference: the module-level `videoEl`
+  // may be reassigned (or cleared) by navigation while the 1.5s timeout is
+  // pending, and a delayed callback must never dereference the mutable global.
+  function waitForSeek(el) {
     return new Promise((resolve) => {
+      if (!el || typeof el.addEventListener !== 'function') { resolve(); return; }
       let done = false;
       const finish = () => {
         if (done) return;
         done = true;
-        videoEl.removeEventListener('seeked', finish);
+        if (typeof el.removeEventListener === 'function') el.removeEventListener('seeked', finish);
         resolve();
       };
-      videoEl.addEventListener('seeked', finish);
+      el.addEventListener('seeked', finish);
       setTimeout(finish, 1500);
     });
   }
@@ -340,13 +424,25 @@
     }
     if (dataUrl === 'STALE') dataUrl = null;
 
+    // Snapshot the video context at the SAME logical moment as the timestamp
+    // (both are read synchronously right after the async frame capture). A
+    // navigation that happens while the frame is being drawn can therefore
+    // never leak a different video's identity/URL into this Moment.
+    const context = getVideoContext();
     const timestamp = currentVideoTime();
     const cap = {
       id: uuid(),
       timestamp: timestamp == null ? 0 : timestamp,
       humanTime: formatTimestamp(timestamp == null ? 0 : timestamp),
       screenshot: { type: 'none' },
-      annotation: ''
+      annotation: '',
+      // The complete video snapshot this Moment belongs to. Each Moment keeps
+      // its own source video, so navigating to another video later never
+      // rewrites an already-captured Moment. Udemy has no ?v= id, so its
+      // lecture id is stored here instead (the project's single videoId field).
+      platform: (context && context.platform) || (adapter && adapter.platform) || '',
+      videoId: (context && (context.videoId || context.lectureId)) || '',
+      videoUrl: buildMomentVideoUrl(context, timestamp == null ? 0 : timestamp)
     };
 
     if (dataUrl) {
@@ -425,15 +521,6 @@
 
     const iframe = document.createElement('iframe');
     iframe.src = sidebarUrl + '?frame=' + encodeURIComponent(frameToken);
-    // Once the sidebar is live, feed it the URL of the page hosting US so it
-    // can resolve the id of the tab that owns it - even when its primary
-    // chrome.runtime.getContexts() path is unavailable. The token keeps the
-    // handshake from being confused by any other listener.
-    iframe.addEventListener('load', () => {
-      try {
-        iframe.contentWindow.postMessage({ type: 'CN_HOST_URL', url: location.href, frameToken }, '*');
-      } catch (e) { /* ignore */ }
-    }, { once: true });
     container.appendChild(iframe);
     return container;
   }
@@ -691,9 +778,17 @@
             }
 
             // The video may have been replaced while the user dragged; refresh
-            // the timestamp from the current binding, or abort.
+            // the timestamp from the current binding, or abort. A navigation
+            // during the repair must NEVER pair this crop with the video that
+            // exists NOW - the selection started on the previous video.
             if (currentVideoTime() == null) {
               videoEl = await findVideo(2000);
+              if (gen !== navigationGeneration) {
+                if (CN && CN.ScreenshotSelector && CN.ScreenshotSelector.cancel) CN.ScreenshotSelector.cancel();
+                restoreVideo();
+                sendResponse({ ok: false, cancelled: true });
+                return;
+              }
             }
             ts = currentVideoTime();
             if (ts == null) {
@@ -701,9 +796,20 @@
               sendResponse({ ok: false, error: 'Video is not ready. Please try again.' });
               return;
             }
+            // Snapshot the video context at the same logical moment as the
+            // timestamp; the sidebar stores both on the screenshot Moment.
+            const context = getVideoContext();
             restoreVideo();
             showToast('Screenshot selected');
-            sendResponse({ ok: true, rect, timestamp: ts, humanTime: formatTimestamp(ts) });
+            sendResponse({
+              ok: true,
+              rect,
+              timestamp: ts,
+              humanTime: formatTimestamp(ts),
+              platform: (context && context.platform) || (adapter && adapter.platform) || '',
+              videoId: (context && (context.videoId || context.lectureId)) || '',
+              videoUrl: buildMomentVideoUrl(context, ts)
+            });
           } catch (e) {
             if (CN && CN.ScreenshotSelector && CN.ScreenshotSelector.cancel) {
               CN.ScreenshotSelector.cancel();
@@ -719,6 +825,53 @@
       if (msg.type === 'CN_GET_VIDEO_CONTEXT') {
         sendResponse(getVideoContext());
         return;
+      }
+
+      // The sidebar asks which page hosts it. This is a chrome.runtime message
+      // (sent by the extension page itself), so an arbitrary PAGE script can
+      // never spoof it the way a window.postMessage handshake could. Only the
+      // content script holding the CURRENT sidebar container's per-tab token
+      // answers; every other tab/listener stays SILENT, because only the first
+      // response can reach the sender and a wrong {ok:false} must never win
+      // the race and starve the correct answer.
+      if (msg.type === 'CN_WHOAMI') {
+        const token = (msg && msg.frameToken) || '';
+        const expected = (sidebarContainer && sidebarContainer.dataset && sidebarContainer.dataset.cnFrameToken) || '';
+        if (token && token === expected) {
+          sendResponse({ ok: true, url: location.href });
+        }
+        return;
+      }
+
+      // The sidebar temporarily hides the on-page container before capturing the
+      // visible tab, so the ClipNote UI itself never appears inside a page
+      // screenshot. Visibility is toggled with a saved inline-styles value so
+      // the exact prior state is restored even if the capture fails.
+      if (msg.type === 'CN_HOST_VISIBILITY') {
+        (async () => {
+          try {
+            // Bind the CURRENT container (even when a navigation replaced it).
+            const el = sidebarContainer || document.querySelector('#cn-sidebar-container');
+            if (el) {
+              if (msg.visible) {
+                if (el.dataset && el.dataset.cnRestoreDisplay !== undefined) {
+                  const prior = el.dataset.cnRestoreDisplay;
+                  delete el.dataset.cnRestoreDisplay;
+                  el.style.display = prior || '';
+                }
+              } else {
+                if (el.dataset && el.dataset.cnRestoreDisplay === undefined) {
+                  el.dataset.cnRestoreDisplay = el.style.display;
+                }
+                el.style.display = 'none';
+              }
+            }
+            sendResponse({ ok: true });
+          } catch (e) {
+            sendResponse({ ok: false, error: e && e.message ? e.message : String(e) });
+          }
+        })();
+        return true;
       }
 
       // The sidebar asked the video to jump to a time.
@@ -777,21 +930,35 @@
             if (!videoEl.isConnected || currentVideoTime() == null) {
               throw new Error('Video is not ready. Please try again.');
             }
+            // Bind the element this capture started on into a LOCAL reference:
+            // navigation may later clear or reassign the module-level videoEl,
+            // and every delayed action below must act on THIS element - never
+            // on a newer video that now belongs to a different page.
+            const el = videoEl;
             let target = Number(msg.seekTo);
             if (!Number.isFinite(target) || target < 0) target = 0;
-            const duration = videoEl.duration;
+            const duration = el.duration;
             if (Number.isFinite(duration) && duration > 0 && target > duration) {
               target = duration;
             }
-            const wasPaused = videoEl.paused;
-            videoEl.currentTime = target;
-            await waitForSeek();
+            const wasPaused = el.paused;
+            el.currentTime = target;
+            await waitForSeek(el);
             await sleep(150);
             const cap = await captureFrame();
             cap.timestamp = Math.floor(target);
             cap.humanTime = formatTimestamp(target);
-            // Restore pause state when the user was watching paused.
-            if (wasPaused && !videoEl.paused) videoEl.pause();
+            // The videoUrl snapshot must match the FINAL timestamp reported on
+            // the Moment (captureFrame built it from its own read).
+            cap.videoUrl = buildMomentVideoUrl(cap, cap.timestamp);
+            // Restore the pause state ONLY when this capture still belongs to
+            // the page it started on, and only on the element we captured, so
+            // a navigation can never pause the NEW video by accident.
+            if (gen === navigationGeneration) {
+              if (wasPaused && el.isConnected && !el.paused) {
+                try { el.pause(); } catch (e) { /* ignore */ }
+              }
+            }
             if (gen !== navigationGeneration) throw new Error('The page changed during capture. Please try again.');
             showToast(`Captured at ${cap.humanTime}`);
             sendResponse({ ok: true, capture: cap });
@@ -845,6 +1012,9 @@
         await injectSidebar();
       }
       ensureVideo();
+      // A navigation often lands exactly on a lecture a Moment was opened for;
+      // apply (and clear) any matching one-shot seek, e.g. Udemy SPA turns.
+      consumePendingSeek();
     } catch (e) {
       console.error('[SNT] navigation error', e);
     }
@@ -1010,6 +1180,9 @@
     if (cnEnabled && isWatchPage()) {
       await injectSidebar();
       videoEl = await findVideo();
+      // A page that just opened after a Moment click may carry a one-shot
+      // "seek this lecture" request; apply (and clear) it when it matches.
+      consumePendingSeek();
     }
   }
 

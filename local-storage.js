@@ -1187,6 +1187,11 @@ export function mergeScannedFiles(parsedFiles, sidecars, existingNotes) {
         timestamp: (meta && Number.isFinite(meta.timestamp)) ? meta.timestamp : (f.timestamp || 0),
         // The friendly time text.
         humanTime: (meta && meta.humanTime) || f.humanTime || '',
+        // The moment's own video snapshot (recovered from the sidecar when it
+        // was stored there; absent for moments created before this feature).
+        platform: (meta && typeof meta.platform === 'string') ? meta.platform : '',
+        videoId: (meta && typeof meta.videoId === 'string') ? meta.videoId : '',
+        videoUrl: (meta && typeof meta.videoUrl === 'string') ? meta.videoUrl : '',
         // Restore the annotation that existed before the rebuild.
         annotation: (meta && meta.annotation) || '',
         // The file this screenshot lives at.
@@ -1194,8 +1199,12 @@ export function mergeScannedFiles(parsedFiles, sidecars, existingNotes) {
         // The relative path into the chosen folder.
         relativePath: f.relativePath,
         // Where the moment sits in the note (sidecar order when known, so a
-        // saved reorder survives a rebuild).
-        sortOrder: (meta && Number.isFinite(meta.sortOrder)) ? meta.sortOrder : note.moments.length,
+        // saved reorder survives a rebuild). Filename-only recoveries leave
+        // the field UNSET: the sorting pass below (and the sidebar renderer)
+        // treat a missing sortOrder as "goes last", keeping v1 leftovers
+        // after any reordered v2 moments instead of letting filename order
+        // shuffle them ahead.
+        sortOrder: (meta && Number.isFinite(meta.sortOrder)) ? meta.sortOrder : undefined,
         // When it was captured.
         createdAt: (meta && meta.createdAt) || Date.now(),
         // When it was last changed.
@@ -1206,6 +1215,22 @@ export function mergeScannedFiles(parsedFiles, sidecars, existingNotes) {
       // Count the recovery.
       added++;
     }
+  }
+
+  // Restore the user's saved ordering after a rebuild/recovery: sort every
+  // note's moments by their persisted sortOrder (moments without a usable
+  // sortOrder sort LAST, stable so equal keys keep their stored order). The
+  // sidecars record those sortOrders, so a dragged reorder now survives a
+  // storage wipe + rebuild instead of snapping back to filename order. Notes
+  // built purely from v1 filenames carry no sortOrder at all and keep their
+  // scan order.
+  for (const note of notes) {
+    const moments = note.moments || [];
+    if (moments.length < 2 || !moments.some((m) => m && Number.isFinite(m.sortOrder))) continue;
+    note.moments = moments
+      .map((m, index) => ({ m, index, sort: m && Number.isFinite(m.sortOrder) ? m.sortOrder : Number.MAX_SAFE_INTEGER }))
+      .sort((a, b) => (a.sort - b.sort) || (a.index - b.index))
+      .map((x) => x.m);
   }
 
   // Hand everything back to the caller.
@@ -1260,6 +1285,10 @@ export async function saveNoteSidecar(note) {
       id: (m && m.id) || '',
       timestamp: (m && Number.isFinite(m.timestamp) && m.timestamp >= 0) ? m.timestamp : 0,
       humanTime: (m && typeof m.humanTime === 'string') ? m.humanTime : '',
+      // The moment's own video snapshot (per-moment source video).
+      platform: (m && typeof m.platform === 'string') ? m.platform : '',
+      videoId: (m && typeof m.videoId === 'string') ? m.videoId : '',
+      videoUrl: (m && typeof m.videoUrl === 'string') ? m.videoUrl : '',
       annotation: (m && typeof m.annotation === 'string') ? m.annotation : '',
       imageFileName: (m && typeof m.imageFileName === 'string') ? m.imageFileName : '',
       relativePath: (m && typeof m.relativePath === 'string') ? m.relativePath : '',

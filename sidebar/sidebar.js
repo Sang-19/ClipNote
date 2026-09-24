@@ -170,6 +170,10 @@ import * as ls from '../local-storage.js';
   // The chrome.storage key holding the index of manual webpage screenshots
   // (the image data itself lives in IndexedDB, like moment screenshots).
   const SHOTS_KEY = 'clipnote_manual_shots';
+  // One-shot request to seek the lecture this URL is opening (Udemy, whose
+  // URLs cannot carry a timestamp). Written here, consumed by the content
+  // script on the newly opened lecture page.
+  const PENDING_SEEK_KEY = 'clipnote_pending_seek';
   // Legacy key names used before the ClipNote rename.
   const OLD_NOTE_KEY = 'snt_notes';
   const OLD_ACTIVE_KEY = 'snt_active_note_id';
@@ -351,6 +355,9 @@ import * as ls from '../local-storage.js';
       if (tombstonedNotes.has(note.id)) return;
       if (tombstonesMoments.has(key)) return;
       if (!findNote(note.id)) return;
+      // Already on disk: nothing left to write, and never downgrade the state
+      // (a blob preview must not be re-labelled "noimage" by this function).
+      if (moment.saveState === 'saved' && moment.relativePath) return;
 
       // The state we'll report back for this moment.
       let newState = null;
@@ -395,6 +402,19 @@ import * as ls from '../local-storage.js';
           // Stamp the note's own folder with a metadata sidecar (best effort)
           // so the filesystem alone can restore the title after a reinstall.
           await ls.saveNoteSidecar(note);
+          // The original is now on disk. Free the large inline image (and its
+          // redundant IndexedDB copy) by swapping the in-memory data-url for a
+          // blob preview of the saved file, so memory and storage stop growing
+          // by a whole screenshot per capture - the file on disk becomes the
+          // single source of truth. Best effort: a hiccup here must never
+          // undo a successful save.
+          try {
+            const preview = await ls.readBlobUrl(moment.relativePath);
+            if (preview && moment.screenshot && moment.screenshot.type === 'data-url') {
+              await idbDelete(shotKey(note.id, moment.id));
+              moment.screenshot = { type: 'blob-url', url: preview };
+            }
+          } catch (e) { /* keep the data-url fallback: capture is safe */ }
         }
       } catch (e) {
         // The write failed. If the note was deleted mid-flight, stop silently
@@ -663,27 +683,51 @@ import * as ls from '../local-storage.js';
     })();
   }
 
-  // Wait (bounded) for the host content script to feed us the page URL.
-  function waitForHostUrl() {
+  // Ask the host content script for the page URL over chrome.runtime messaging.
+  // This channel is invisible to arbitrary PAGE scripts (unlike the old
+  // window.postMessage handshake, which a page could read and spoof once it
+  // knew the token), and only the content script holding THIS sidebar's token
+  // ever replies. Returns the URL string or ''.
+  function whoAmI() {
     return new Promise((resolve) => {
       let done = false;
       const finish = (url) => {
         if (done) return;
         done = true;
-        window.removeEventListener('message', onMsg);
-        resolve(url || null);
+        resolve(url || '');
       };
-      const onMsg = (e) => {
-        const m = e && e.data;
-        // Only accept the handshake we expect, and only from our own token.
-        if (!m || m.type !== 'CN_HOST_URL') return;
-        if (ownToken && m.frameToken !== ownToken) return;
-        finish(typeof m.url === 'string' ? m.url : '');
-      };
-      window.addEventListener('message', onMsg);
-      // The content script posts as soon as the iframe loads; stay bounded.
-      setTimeout(() => finish(null), 1500);
+      // Bound the wait: after the extension context dies there is no answer.
+      const timer = setTimeout(() => finish(''), 1200);
+      try {
+        chrome.runtime.sendMessage({ type: 'CN_WHOAMI', frameToken: ownToken }, (res) => {
+          clearTimeout(timer);
+          if (!chrome.runtime.lastError && res && res.ok === true && typeof res.url === 'string') {
+            finish(res.url);
+          } else {
+            finish('');
+          }
+        });
+      } catch (e) {
+        clearTimeout(timer);
+        finish('');
+      }
     });
+  }
+
+  // Wait (bounded) for the host content script to reveal the page URL. Runtime
+  // messaging is tried with a few short retries in case the content script was
+  // just (re)registered mid-startup.
+  function waitForHostUrl() {
+    return (async () => {
+      const url = await whoAmI();
+      if (url) return url;
+      for (let i = 0; i < 3; i++) {
+        await new Promise((r) => setTimeout(r, 150));
+        const again = await whoAmI();
+        if (again) return again;
+      }
+      return null;
+    })();
   }
 
   // Memoized accessor for the own-tab id (null when unresolvable).
@@ -747,6 +791,38 @@ import * as ls from '../local-storage.js';
       .replace(/'/g, '&#39;');
   }
 
+  // The order moments are displayed and exported in: by their saved sortOrder
+  // (a number, from refreshSortOrders()/persisted on rebuild), with moments
+  // that have no usable sortOrder sorted LAST in their stored order. A stable
+  // sort keeps equal keys in the exact order they were stored in, so an old
+  // moment without a sortOrder never jumps around after a rebuild.
+  function momentsInDisplayOrder(moments) {
+    if (!moments || !Array.isArray(moments)) return [];
+    const hasSortOrder = moments.some((m) => Number.isFinite(m.sortOrder));
+    if (!hasSortOrder) return moments;
+    return moments
+      .map((m, index) => ({ m, index, sort: Number.isFinite(m.sortOrder) ? m.sortOrder : Number.MAX_SAFE_INTEGER }))
+      .sort((a, b) => (a.sort - b.sort) || (a.index - b.index))
+      .map((x) => x.m);
+  }
+
+  // Guards a URL before it is trusted as a link target (PDF timestamp links
+  // and momentWatchUrl()). Only http(s) URLs pass; anything else (javascript:,
+  // data:, blob:, chrome-extension:, malformed or empty strings) yields '', so
+  // stored values can never become executable or privileged link targets.
+  function isSafeExternalUrl(value) {
+    const candidate = String(value == null ? '' : value).trim();
+    if (!candidate) return '';
+    let parsed;
+    try {
+      parsed = new URL(candidate);
+    } catch (e) {
+      return '';
+    }
+    const proto = parsed.protocol.toLowerCase();
+    return (proto === 'http:' || proto === 'https:') ? candidate : '';
+  }
+
   // Ask the content script for the current video's details.
   async function getVideoContext() {
     // Send the context request and return its reply.
@@ -765,6 +841,56 @@ import * as ls from '../local-storage.js';
   async function seekTo(seconds) {
     // Send the seek message (we don't use the reply).
     await sendToContentScript({ type: 'CN_SEEK_TO', seconds });
+  }
+
+  // The authoritative "watch this Moment" URL.
+  //   * New moments carry their own stored videoUrl (snapshotted at capture
+  //     time, so it survives navigating to another video).
+  //   * Legacy moments without one only ever get a URL generated from a video
+  //     id + timestamp that were ALREADY stored on the note/moment - never from
+  //     the current page - and only for YouTube (canonical watch URLs) or Udemy
+  //     (canonical lecture URL rebuilt from the stored course slug + lecture id;
+  //     a numeric course id is never a reliable slug, so those stay '').
+  // Returns '' when no trustworthy URL exists.
+  function momentWatchUrl(moment, note) {
+    // A stored URL is always authoritative - but only when it is a real
+    // http(s) link. A corrupt/unsafe stored value (javascript:, data:, ...)
+    // must never be offered as a click target, so it falls through to the
+    // legacy rebuild instead of being handed to the page.
+    const stored = (moment && typeof moment.videoUrl === 'string') ? moment.videoUrl : '';
+    const safeStored = isSafeExternalUrl(stored);
+    if (safeStored) return safeStored;
+    // Legacy fallback: build only from a reliably stored video id.
+    const platform = (moment && moment.platform) || (note && note.platform) || '';
+    const videoId = (moment && moment.videoId) || (note && note.video && note.video.id) || '';
+    if (platform === 'youtube' && videoId) {
+      const secs = Math.max(0, Math.floor((moment && moment.timestamp) || 0));
+      const base = 'https://www.youtube.com/watch?v=' + encodeURIComponent(videoId);
+      return secs > 0 ? base + '&t=' + secs + 's' : base;
+    }
+    if (platform === 'udemy' && videoId) {
+      // Only a real course slug (non-numeric, not the numeric id copy) gives a
+      // trustworthy legacy lecture URL; otherwise there is nothing to open.
+      const course = (note && note.course) || {};
+      const slug = course.slug;
+      const id = course.id;
+      if (typeof slug === 'string' && slug &&
+          (slug !== id || !id)) {
+        const safeSlug = encodeURIComponent(slug);
+        const safeLecture = encodeURIComponent(String(videoId));
+        return 'https://www.udemy.com/course/' + safeSlug + '/learn/lecture/' + safeLecture + '/';
+      }
+    }
+    return '';
+  }
+
+  // The video identity a moment refers to (used for same-video detection only;
+  // the moment's stored source is always what actually gets opened).
+  function momentVideoIdentity(moment, note) {
+    return {
+      platform: (moment && moment.platform) || (note && note.platform) || '',
+      videoId: (moment && moment.videoId) || (note && note.video && note.video.id) || ''
+    };
   }
 
   // ----------------------- Capturing -----------------------
@@ -813,6 +939,13 @@ import * as ls from '../local-storage.js';
       timestamp: cap.timestamp || 0,
       // The same time as friendly text.
       humanTime: cap.humanTime || formatTimestamp(cap.timestamp || 0),
+      // The video snapshot THIS moment belongs to. Every moment keeps its own
+      // source video (platform/videoId/videoUrl captured at capture time), so
+      // moments captured after navigating to another video still point at the
+      // video they came from.
+      platform: cap.platform || note.platform || 'youtube',
+      videoId: cap.videoId || '',
+      videoUrl: cap.videoUrl || '',
       // The screenshot data (kept in IndexedDB as the preview cache).
       screenshot: screenshotData,
       // Any annotation that came with it.
@@ -1014,7 +1147,44 @@ import * as ls from '../local-storage.js';
 
     // Lock the capture buttons for the whole flow (blocks double-trigger).
     setCapturing(true);
+
+    // Hide/restore our OWN page sidebar around the frame capture, so the
+    // ClipNote UI itself never appears inside a page screenshot (the panel
+    // used to be captured along with the page). These helpers are function-
+    // scoped so the outer finally can guarantee a restore on EVERY exit path,
+    // never leaving the page minus its sidebar.
+    const hideSidebarForCapture = async () => {
+      await sendToContentScript({ type: 'CN_HOST_VISIBILITY', visible: false });
+      // Give the page a frame with the container gone before shooting.
+      await new Promise((r) => setTimeout(r, 150));
+    };
+    const restoreSidebar = async () => {
+      await sendToContentScript({ type: 'CN_HOST_VISIBILITY', visible: true });
+    };
+
     try {
+      // 0) Page screenshots need the captureVisibleTab permission. It is
+      //    requested LAZILY the first time, as an OPTIONAL (<all_urls>) grant:
+      //    a permanent requirement adds the scary "all websites" install
+      //    warning, while optional keeps the install clean and lets Chrome ask
+      //    once. Requested at the very start of the flow (closest to the user
+      //    gesture) and before any other page work, so the prompt can appear.
+      //    A declined grant simply aborts with a hint - nothing is captured.
+      let canCapture = true;
+      try {
+        const granted = await chrome.permissions.contains({ origins: ['<all_urls>'] });
+        if (!granted) {
+          canCapture = await chrome.permissions.request({ origins: ['<all_urls>'] });
+        }
+      } catch (e) {
+        canCapture = false;
+      }
+      if (!canCapture) {
+        setStatus('Screenshot needs one-time permission \u2014 approve it in the prompt, or in the extension\u2019s details page.');
+        setTimeout(() => setStatus(''), 5000);
+        return;
+      }
+
       // 1) Capture the visible frame of OUR OWN tab BEFORE showing any overlay.
       //    This is the single static frame the whole screenshot flow operates
       //    on. captureVisibleTab only captures the ACTIVE tab of a window, so
@@ -1052,6 +1222,14 @@ import * as ls from '../local-storage.js';
           return;
         }
       }
+      // 1b) Hide our OWN sidebar in the page before the frame is captured, so the
+      //     frame never contains it. The restore is issued right after the
+      //     frame is safely in hand (BEFORE the selection overlay is drawn) and
+      //     repeated in the outer finally as a safety net.
+      try {
+        await hideSidebarForCapture();
+      } catch (e) { /* a failed hide must never block the screenshot */ }
+
       let dataUrl = null;
       try {
         dataUrl = await chrome.tabs.captureVisibleTab(
@@ -1059,16 +1237,21 @@ import * as ls from '../local-storage.js';
       } catch (e) {
         // captureVisibleTab threw (no permission, tab not capturable). Without
         // a real frame we refuse to enter selection mode or fake a screenshot.
+        await restoreSidebar();
         setStatus('Screenshot failed \u2014 check that this tab is capturable.');
         setTimeout(() => setStatus(''), 4000);
         return;
       }
       if (typeof dataUrl !== 'string' || !/^data:image\//.test(dataUrl)) {
         // The captured frame was invalid: abort cleanly, page stays untouched.
+        await restoreSidebar();
         setStatus('Screenshot failed \u2014 the captured frame was invalid.');
         setTimeout(() => setStatus(''), 4000);
         return;
       }
+      // The frame is safely in hand: restore the sidebar BEFORE selection mode
+      // so the user keeps the whole UI while dragging the crop rectangle.
+      await restoreSidebar();
 
       // Keep the ORIGINAL frame for the final crop, but carry only a resized
       // copy across to the content script for the frozen selection layer so
@@ -1128,7 +1311,11 @@ import * as ls from '../local-storage.js';
         timestamp,
         humanTime: selRes.humanTime || formatTimestamp(timestamp),
         screenshot: { type: 'data-url', dataUrl: cropped },
-        annotation: ''
+        annotation: '',
+        // The video snapshot reported by the content script at selection time.
+        platform: selRes.platform || '',
+        videoId: selRes.videoId || '',
+        videoUrl: selRes.videoUrl || ''
       };
       await addCaptureToNote(cap, targetNoteId);
       await saveAllNotes();
@@ -1142,6 +1329,8 @@ import * as ls from '../local-storage.js';
       setStatus('Screenshot failed \u2014 check that this tab is capturable.');
       setTimeout(() => setStatus(''), 4000);
     } finally {
+      // Safety net: whatever path was taken, the page sidebar must be back.
+      try { await restoreSidebar(); } catch (e) { /* best effort */ }
       // Always re-enable the buttons.
       setCapturing(false);
     }
@@ -1580,16 +1769,37 @@ import * as ls from '../local-storage.js';
 
   // ----------------------- Note detail view -----------------------
 
+  // Serializes openNote so rapid A→B→C clicks can never interleave. Each call
+  // gets a monotonic version; work runs strictly in order and any call that was
+  // superseded by a newer one while awaiting aborts, so the final visible note
+  // and the stored ACTIVE_KEY are always the LAST one clicked - never a stale
+  // note with a mismatched active id.
+  let openNoteVersion = 0;
+  let openNoteChain = null;
+
   // Open a specific note and show its moments.
   async function openNote(noteId) {
-    // Save the current note first if one is open.
-    if (activeNoteId) await saveAllNotes();
-    // Set the new active note id.
-    activeNoteId = noteId;
-    // Remember it so it reopens next time.
-    await storage.set({ [ACTIVE_KEY]: noteId });
-    // Show the note view.
-    showNoteView();
+    openNoteVersion += 1;
+    const version = openNoteVersion;
+    const run = async () => {
+      // A newer openNote() superseded this one while it waited in the chain.
+      if (version < openNoteVersion) return;
+      // Save the current note first if one is open.
+      if (activeNoteId) {
+        await saveAllNotes();
+        // The save is done, but an even newer click may have arrived meanwhile.
+        if (version < openNoteVersion) return;
+      }
+      // Set the new active note id.
+      activeNoteId = noteId;
+      // Remember it so it reopens next time.
+      await storage.set({ [ACTIVE_KEY]: noteId });
+      // Show the note view.
+      showNoteView();
+    };
+    // Chain: each call runs after the previous one settles, never concurrently.
+    openNoteChain = Promise.resolve(openNoteChain).then(run, run);
+    return openNoteChain;
   }
 
   // Paint the header and moments for the open note.
@@ -1648,8 +1858,13 @@ import * as ls from '../local-storage.js';
     // Show how many moments there are.
     momentCount.textContent = String(note.moments.length);
 
+    // Render in display order (saved sortOrder, oldest/missing last) so the
+    // on-screen order always matches the stored order - after a rebuild or a
+    // recovery the array order may not carry the user's chosen ordering.
+    const ordered = momentsInDisplayOrder(note.moments);
+
     // Loop over every moment to build a card.
-    for (const moment of note.moments) {
+    for (const moment of ordered) {
       // The outer card element.
       const card = document.createElement('div');
       // Give it the note card style.
@@ -1719,8 +1934,46 @@ import * as ls from '../local-storage.js';
       timeLink.textContent = moment.humanTime || `${Math.floor(moment.timestamp)}s`;
       // Tooltip explaining the click action.
       timeLink.title = 'Jump to timestamp';
-      // When clicked, jump the video to this time.
-      timeLink.addEventListener('click', () => seekTo(moment.timestamp));
+      // When clicked, use the moment's own stored video source as the authority.
+      // If that video is the one currently open, preserve the in-page seek;
+      // otherwise open the moment's stored URL (never the current page's URL).
+      timeLink.addEventListener('click', () => {
+        const url = momentWatchUrl(moment, note);
+        if (!url) {
+          // Legacy moment with no trustworthy URL: keep the old seek behaviour.
+          seekTo(moment.timestamp);
+          return;
+        }
+        const mine = momentVideoIdentity(moment, note);
+        getVideoContext().then(async (ctx) => {
+          const currentPlatform = (ctx && ctx.platform) || '';
+          const currentVideoId = (ctx && (ctx.videoId || ctx.lectureId)) || '';
+          const sameVideo = !!currentPlatform && !!currentVideoId &&
+            currentPlatform === mine.platform && currentVideoId === mine.videoId;
+          if (sameVideo) {
+            // The moment belongs to the video on screen: seek in place.
+            seekTo(moment.timestamp);
+          } else {
+            // A different (or unknown) video: open the moment's own URL.
+            // Udemy URLs cannot carry a timestamp, so hand the newly opened
+            // lecture a one-shot seek request the content script consumes
+            // once the page's video is available.
+            if (mine.platform === 'udemy' && mine.videoId) {
+              try {
+                await storage.set({
+                  [PENDING_SEEK_KEY]: {
+                    platform: 'udemy',
+                    lectureId: String(mine.videoId),
+                    timestamp: moment.timestamp || 0,
+                    createdAt: Date.now()
+                  }
+                });
+              } catch (e) { /* best effort; the lecture still opens */ }
+            }
+            window.open(url, '_blank', 'noopener,noreferrer');
+          }
+        });
+      });
 
       // The small delete button.
       const deleteBtn = document.createElement('button');
@@ -2375,42 +2628,86 @@ import * as ls from '../local-storage.js';
   // ----------------------- Export -----------------------
 
   // Print the open note as a styled PDF document.
-  function exportPdf() {
+  // Resolve once EVERY image in the printable page has loaded or failed, so the
+  // print dialog never opens on a half-painted document. A hard timeout caps
+  // the whole wait, so one stuck screenshot can never hold the dialog hostage.
+  function waitForPrintImages(doc, timeoutMs) {
+    const images = Array.from(doc.images);
+    if (images.length === 0) return Promise.resolve();
+    const overall = new Promise((resolve) => setTimeout(resolve, timeoutMs));
+    const perImage = images.map((img) => new Promise((resolve) => {
+      const settle = () => resolve();
+      // A cached/already-painted image resolves instantly.
+      if (img.complete && img.naturalWidth > 0) { resolve(); return; }
+      img.addEventListener('load', settle, { once: true });
+      img.addEventListener('error', settle, { once: true });
+      if (typeof img.decode === 'function') {
+        // decode() rejects on invalid data too - either way we may proceed.
+        img.decode().then(settle, settle);
+      }
+      setTimeout(settle, timeoutMs);
+    }));
+    // Wait for all of them, but never longer than the overall cap.
+    return Promise.race([Promise.all(perImage), overall]);
+  }
+
+  async function exportPdf() {
     // Get the open note.
     const note = getActiveNote();
     // If there's nothing to export, stop.
     if (!note || !note.moments || note.moments.length === 0) return;
 
-    // Build the HTML for every moment.
-    const momentsHtml = note.moments.map((m) => {
+    // Build the HTML for every moment, in the SAME display order the list
+    // uses. Blob previews are resolved from the saved file as the blocks are
+    // built, so a stored moment's screenshot is never skipped; a moment whose
+    // image genuinely can't be resolved still prints its timestamp (+ note)
+    // instead of silently vanishing from the PDF.
+    const blocks = [];
+    for (const m of momentsInDisplayOrder(note.moments)) {
       // The image HTML for this moment.
       let imgHtml = '';
       // If it has an inline screenshot, embed it.
       if (m.screenshot && m.screenshot.type === 'data-url' && m.screenshot.dataUrl) {
-        imgHtml = `<img src="${m.screenshot.dataUrl}" />`;
+        imgHtml = '<img src="' + m.screenshot.dataUrl + '" />';
+      } else if (m.screenshot && m.screenshot.type === 'blob-url' && m.screenshot.url) {
+        // A blob preview of the file saved in the user's folder.
+        imgHtml = '<img src="' + escapeHtml(m.screenshot.url) + '" />';
       } else if (m.screenshot && m.screenshot.type === 'remote-url' && m.screenshot.url) {
         // Otherwise use the remote image URL.
-        imgHtml = `<img src="${escapeHtml(m.screenshot.url)}" />`;
+        imgHtml = '<img src="' + escapeHtml(m.screenshot.url) + '" />';
+      } else if (m.relativePath) {
+        // A stored moment whose in-memory screenshot was stripped (e.g. just
+        // saved to disk): resolve a preview from the file so it still exports.
+        try {
+          const blobUrl = (typeof ls.readBlobUrl === 'function') ? await ls.readBlobUrl(m.relativePath) : null;
+          if (blobUrl) imgHtml = '<img src="' + blobUrl + '" />';
+        } catch (e) { /* fall through: the moment still prints its text */ }
       }
-      // If there's no image at all, skip this moment.
-      if (!imgHtml) return '';
 
       // The friendly time text.
-      const timeStr = escapeHtml(m.humanTime || `${Math.floor(m.timestamp)}s`);
+      const timeStr = escapeHtml(m.humanTime || Math.floor(m.timestamp) + 's');
+      // The timestamp block: a clickable hyperlink pointing at THIS moment's
+      // video via momentWatchUrl() (which uses the stored videoUrl when one
+      // exists and safely reconstructs one for legacy Moments without it),
+      // otherwise the plain timestamp. The URL is strictly validated (http(s)
+      // only) so stored values can never inject executable markup or
+      // privileged links into the PDF.
+      const linkUrl = isSafeExternalUrl(momentWatchUrl(m, note));
+      const tsHtml = linkUrl
+        ? '<a class="pdf-timestamp" href="' + escapeHtml(linkUrl) + '">' + timeStr + '</a>'
+        : '<div class="pdf-timestamp">' + timeStr + '</div>';
       // The annotation HTML, with or without text. Every user-provided field is
       // escaped so a note/annotation can never inject markup into the PDF.
       const annHtml = (m.annotation && m.annotation.trim())
         // With a note: show time and the note.
-        ? `<div class="pdf-timestamp">${timeStr}</div><div class="pdf-annotation">${escapeHtml(m.annotation)}</div>`
+        ? tsHtml + '<div class="pdf-annotation">' + escapeHtml(m.annotation) + '</div>'
         // Without a note: just the time.
-        : `<div class="pdf-timestamp">${timeStr}</div>`;
+        : tsHtml;
 
       // Combine everything into one moment block.
-      return `<div class="moment">
-      <div class="moment-image">${imgHtml}</div>
-      <div class="moment-text">${annHtml}</div>
-    </div>`;
-    }).join('\n');
+      blocks.push('<div class="moment">\n      <div class="moment-image">' + imgHtml + '</div>\n      <div class="moment-text">' + annHtml + '</div>\n    </div>');
+    }
+    const momentsHtml = blocks.join('\n');
 
     // The title for the document.
     const title = note.title || 'Notes';
@@ -2442,7 +2739,8 @@ import * as ls from '../local-storage.js';
   .moment:last-child { border-bottom: none; }
   .moment-image img { display: block; max-width: 100%; height: auto; border: 1px solid #ddd; border-radius: 6px; }
   .moment-text { display: flex; flex-direction: column; gap: 8px; }
-  .pdf-timestamp { font-size: 13px; font-weight: 700; color: #e07a5f; }
+  .pdf-timestamp { font-size: 13px; font-weight: 700; color: #e07a5f; text-decoration: none; }
+  a.pdf-timestamp { text-decoration: none; color: #e07a5f; }
   .pdf-annotation { font-size: 14px; line-height: 1.6; white-space: pre-wrap; }
 </style></head>
 <body>
@@ -2458,27 +2756,40 @@ import * as ls from '../local-storage.js';
     iframe.style.left = '-9999px';
     // Add it to the document.
     document.body.appendChild(iframe);
-    // Start writing into its document.
-    iframe.contentDocument.open();
-    // Write our HTML into it.
-    iframe.contentDocument.write(html);
-    // Finish the write.
-    iframe.contentDocument.close();
-    // Wait a moment for it to render:
-    setTimeout(() => {
-      // Guard against errors.
-      try {
-        // Give the iframe focus.
-        iframe.contentWindow.focus();
-        // Open the browser's print dialog.
-        iframe.contentWindow.print();
-        // Remove the iframe after printing.
-        setTimeout(() => document.body.removeChild(iframe), 1000);
-      } catch (e) {
-        // Make sure the iframe is cleaned up.
-        document.body.removeChild(iframe);
+    // Cleanup guaranteed on every path after this point.
+    const removeIframe = () => {
+      try { if (iframe && iframe.parentElement) document.body.removeChild(iframe); } catch (e) { /* ignore */ }
+    };
+    try {
+      // Start writing into its document.
+      const doc = iframe.contentDocument;
+      if (!doc) {
+        removeIframe();
+        return;
       }
-    }, 100);
+      doc.open();
+      // Write our HTML into it.
+      doc.write(html);
+      // Finish the write.
+      doc.close();
+      // WAIT for every embedded image to be ready (data URLs, blob previews,
+      // slow screenshots) instead of a blind 100ms that could open the print
+      // dialog on an empty or half-painted page - and never print before the
+      // URLs to those screenshots are embedded.
+      await waitForPrintImages(doc, 5000);
+      // Let the browser paint the now-loaded document.
+      await new Promise((r) => setTimeout(r, 250));
+      // Give the iframe focus.
+      iframe.contentWindow.focus();
+      // Open the browser's print dialog.
+      iframe.contentWindow.print();
+      // Removing too fast can abort a print; give the dialog a beat, then
+      // always remove the iframe so no stray hidden frame accumulates.
+      setTimeout(removeIframe, 1000);
+    } catch (e) {
+      // Make sure the iframe is cleaned up even when printing failed.
+      removeIframe();
+    }
   }
 
   // ----------------------- Events -----------------------
@@ -2547,12 +2858,14 @@ import * as ls from '../local-storage.js';
     window.addEventListener('pagehide', () => {
       if (ls && typeof ls.revokeAllBlobUrls === 'function') ls.revokeAllBlobUrls();
     }, { once: true });
+    // Carry any legacy data into the new keys FIRST, so the migration is part of
+    // the data load that follows (a legacy note id can then reopen correctly
+    // on first launch instead of being invisible to the fresh-load check).
+    await migrateOldData();
     // Load the saved notes and screenshots.
     await loadAllNotes();
     // Load the saved manual webpage screenshots.
     await loadManualShots();
-    // Carry over any data saved before the ClipNote rename.
-    await migrateOldData();
 
     // Tell the user when no screenshot folder is connected (captures still
     // work - the originals just can't be written out until one is set).

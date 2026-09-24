@@ -84,17 +84,39 @@ async function applyToTab(enabled) {
           files: CONTENT_SCRIPT_FILES
         });
       } catch (e) {
-        // Already injected - that's fine.
+        // Injection can fail for REAL reasons: a restricted page (chrome://,
+        // the web store), a blocked host, a tab that just died, or the whole
+        // extension context being invalidated after an update/reload. Serving
+        // on our own pages (storage/storage.html) it is expected; elsewhere it
+        // is a genuine error and is logged - not silently swallowed as if the
+        // scripts had already been injected.
+        const text = String((e && e.message) || e);
+        const benign = /already been injected|already.*running|No work to do/i.test(text);
+        if (!benign) {
+          console.warn('[ClipNote] Could not inject content scripts:', text);
+        }
       }
     }
 
     // Tell the content script to show or hide the sidebar.
-    chrome.tabs.sendMessage(tab.id, { type: 'CN_TOGGLE', enabled }, () => {
-      // Swallow the "no receiver" error so the console stays clean.
-      void chrome.runtime.lastError;
+    chrome.tabs.sendMessage(tab.id, { type: 'CN_TOGGLE', enabled }, (res) => {
+      // "Receiving end does not exist" is the normal no-injection case, but an
+      // invalidated extension context is a real failure worth distinguishing.
+      if (chrome.runtime.lastError) {
+        const text = String(chrome.runtime.lastError.message || '');
+        const contextGone = /context invalidated|receiving end does not exist/i.test(text);
+        if (!contextGone) console.warn('[ClipNote] Toggle message failed:', text);
+      }
+      void res;
     });
   } catch (e) {
-    // No content script on this page; ignore.
+    // A soft failure here (no active tab / context died mid-flight) must never
+    // crash the popup, but it is a real event, so log it instead of pretending
+    // it never happened.
+    const text = String((e && e.message) || e);
+    if (!/receiving end does not exist|no tab with id/i.test(text)) {
+      console.warn('[ClipNote] applyToTab:', text);
+    }
   }
 }
 
