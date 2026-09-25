@@ -1177,16 +1177,28 @@ import * as ls from '../local-storage.js';
     // so the UI shows the new moment immediately without freezing. The write
     // itself is deletion-safe (persistMomentScreenshot checks tombstones).
     const moment = note.moments[note.moments.length - 1];
-    persistMomentScreenshot(note, moment);
+    // Never fire-and-forget a promise that can reject: persistMomentScreenshot
+    // may reject AFTER its internal write (e.g. saveAllNotes or renderMoments
+    // throw outside its inner try/catch). An uncaught rejection would surface
+    // as an unrelated error even though the screenshot was saved fine. Log it
+    // explicitly instead.
+    void persistMomentScreenshot(note, moment).catch((error) => {
+      console.error('persistMomentScreenshot failed after capture', error);
+    });
     return true;
   }
 
-  // Scroll the moments list down to the newest card.
+  // Scroll the moments list down to the newest card. Only ClipNote's OWN
+  // scrollable container is ever scrolled - never scrollIntoView(), which can
+  // propagate scrolling up to the host page behind the sidebar.
   async function scrollToLast() {
-    // The last card in the list.
-    const last = momentsList.lastElementChild;
-    // If one exists, scroll it smoothly into view.
-    if (last) last.scrollIntoView({ behavior: 'smooth', block: 'end' });
+    // The scrollable moments list container itself.
+    const list = momentsList;
+    // Only scroll when there is actually a card to reveal.
+    if (!list.lastElementChild) return;
+    // Scroll the container directly to its bottom, so the newest moment card
+    // is fully visible while the page around the sidebar never moves.
+    list.scrollTo({ top: list.scrollHeight, behavior: 'smooth' });
   }
 
   // Handle a single click of the "+ Capture" button.
@@ -1202,6 +1214,8 @@ import * as ls from '../local-storage.js';
 
     // Block the buttons while we work.
     setCapturing(true);
+    // True only when the new moment was successfully inserted into its note.
+    let added = false;
     // Guard against errors while capturing.
     try {
       // Capture whatever is on screen right now. On a video-less platform
@@ -1219,7 +1233,7 @@ import * as ls from '../local-storage.js';
       // If we got a capture:
       if (cap) {
         // Add it to the note that was open when the user clicked.
-        const added = await addCaptureToNote(cap, targetNoteId);
+        added = await addCaptureToNote(cap, targetNoteId);
         // Save the notes.
         await saveAllNotes();
         if (!added) {
@@ -1239,10 +1253,12 @@ import * as ls from '../local-storage.js';
       // Always re-enable the buttons.
       setCapturing(false);
     }
-    // Redraw the moments list.
-    renderMoments();
-    // Bring the new card into view.
-    await scrollToLast();
+    // Redraw the moments list and wait until the cards are actually in the DOM.
+    await renderMoments();
+    // Bring the new card into view, but ONLY when the note the capture landed
+    // in is still the one on screen - the user may have switched notes while
+    // the capture was running.
+    if (added && activeNoteId === targetNoteId) await scrollToLast();
   }
 
   // ----------------------- Webpage screenshots -----------------------
@@ -1399,12 +1415,6 @@ import * as ls from '../local-storage.js';
     return { tab, activateFailed: false };
   }
 
-  // Captured-frame diagnostics. Switched OFF once the blank-frame regression is
-  // confirmed fixed on-device (kept ON now per the on-screen trace requirement):
-  // every capture prints its stage + measured sizes so any future blank frame is
-  // pinpointed in seconds instead of re-debugged from scratch.
-  const CAPTURE_TRACE = true;
-
   // Decode a captured frame purely to prove it has REAL pixels. A blank screen
   // composited by the browser still decodes cleanly - only a missing, empty or
   // corrupt bitmap yields zero size, and that is the definitive "the capture
@@ -1489,10 +1499,6 @@ import * as ls from '../local-storage.js';
       // The bitmap must PROVE it has real pixels before anything is cropped.
       const dataUrl = frame.dataUrl;
       const probe = await probeCaptureImage(dataUrl);
-      if (CAPTURE_TRACE) {
-        console.warn('[CN-CAP] +Capture START platform=chatgpt frame='
-          + probe.width + 'x' + probe.height + ' bytes=' + dataUrl.length);
-      }
       if (!probe.width || !probe.height) {
         setStatus('Capture failed \u2014 the captured frame was blank.');
         setTimeout(() => setStatus(''), 4000);
@@ -1511,12 +1517,6 @@ import * as ls from '../local-storage.js';
           planRect.viewport
         );
         if (!contentUrl) contentUrl = dataUrl;
-      }
-      if (CAPTURE_TRACE) {
-        const chk = await probeCaptureImage(contentUrl);
-        console.warn('[CN-CAP] +Capture RESULT='
-          + (planRect ? JSON.stringify(planRect) : 'full-frame-fallback')
-          + ' -> ' + chk.width + 'x' + chk.height + ' bytes=' + contentUrl.length);
       }
 
       // Snapshot the page's context at capture time so the moment remembers
@@ -1560,6 +1560,15 @@ import * as ls from '../local-storage.js';
 
     // Lock the capture buttons for the whole flow (blocks double-trigger).
     setCapturing(true);
+    // True only when the new moment was successfully inserted into its note.
+    let added = false;
+    // Most exits release the splash lock in the finally below (clean cancel,
+    // selection failure, capture error). The one exception is a SUCCESSFUL
+    // save: the lock stays on through the post-save render/scroll tail below
+    // (CN-005) - otherwise a second click can start while the first invocation
+    // is still re-rendering and scrolling, letting two captures interleave on
+    // the same note.
+    let holdCapturingThroughTail = false;
 
     try {
       // 0) Page screenshots need the captureVisibleTab permission. It is
@@ -1608,11 +1617,6 @@ import * as ls from '../local-storage.js';
         return;
       }
       const frameProbe = await probeCaptureImage(frame.dataUrl);
-      if (CAPTURE_TRACE) {
-        console.warn('[CN-CAP] CAPTURE START frame='
-          + frameProbe.width + 'x' + frameProbe.height
-          + ' bytes=' + frame.dataUrl.length);
-      }
       if (!frameProbe.width || !frameProbe.height) {
         setStatus('Screenshot failed \u2014 the captured frame was blank.');
         setTimeout(() => setStatus(''), 4000);
@@ -1644,10 +1648,17 @@ import * as ls from '../local-storage.js';
         type: 'CN_SCREENSHOT_SELECT',
         dataUrl: previewCapture
       });
-      // Silent cancel (Esc) or the content script dropped the message.
+      // `selRes` is NULL only when the message never got an answer: the
+      // content script dropped it (tab navigated, extension context was
+      // invalidated, or Chrome closed the port mid-selection). That is NOT the
+      // user pressing Esc - a genuine cancel always arrives as the object
+      // {ok:false, cancelled:true} handled in the !selRes.ok branch below.
+      // Distinguishing the two (CN-003) matters because a reloaded page is a
+      // real "reconnect" failure, not a quiet user cancel, and the user must
+      // see that this is a connection problem they need to fix.
       if (!selRes) {
-        setStatus('Screenshot cancelled');
-        setTimeout(() => setStatus(''), 2500);
+        setStatus('Screenshot unavailable \u2014 this page disconnected. Please reload the video tab and try again.');
+        setTimeout(() => setStatus(''), 5000);
         return;
       }
       // The content script refused (e.g. video not ready) - show its reason.
@@ -1662,19 +1673,13 @@ import * as ls from '../local-storage.js';
         setTimeout(() => setStatus(''), 2500);
         return;
       }
-
       // 3) Crop the ORIGINAL full-frame capture (from step 1) to the chosen
       //    rectangle - the whole viewport for a plain click, the dragged region
       //    otherwise. This is a straight crop of the visible tab: ClipNote is
       //    part of the saved image whenever the user did not drag it out of the
       //    region. The result is validated before saving.
       const cropped = await cropCapturedImage(originalCapture, selRes.rect, selRes.rect.viewport);
-      const cropProbe = cropped ? await probeCaptureImage(cropped) : null;
-      if (CAPTURE_TRACE) {
-        console.warn('[CN-CAP] selection=' + JSON.stringify(selRes.rect)
-          + (cropProbe ? ' crop=' + cropProbe.width + 'x' + cropProbe.height : ' crop=null')
-          + (cropped ? ' bytes=' + cropped.length : ''));
-      }
+      const cropProbe = await probeCaptureImage(cropped);
       if (!cropped || !cropProbe || !cropProbe.width || !cropProbe.height) {
         setStatus('Couldn\u2019t crop the screenshot.');
         setTimeout(() => setStatus(''), 4000);
@@ -1710,8 +1715,16 @@ import * as ls from '../local-storage.js';
         videoId: selRes.videoId || '',
         videoUrl: selRes.videoUrl || ''
       };
-      await addCaptureToNote(cap, targetNoteId);
+      added = await addCaptureToNote(cap, targetNoteId);
       await saveAllNotes();
+      // The moment is saved and the save is durable. From here on this
+      // invocation only does post-save UI work (re-render + scroll-to-last)
+      // that still belongs to THIS capture, so the lock that blocks a second
+      // screenshot stays on until that tail finishes (CN-005). If anything in
+      // the tail throws it is caught/ignored below; the moment is already safe.
+      // KEEP IN SYNC with the `finally`: that block must NOT release the lock
+      // when this flag is set - the tail is the one releasing it.
+      holdCapturingThroughTail = true;
 
       // Tell the user it worked.
       setStatus('Screenshot saved');
@@ -1719,17 +1732,41 @@ import * as ls from '../local-storage.js';
     } catch (e) {
       // Capture or crop threw (e.g. no permission, invalid rectangle). No
       // moment was created, so nothing partial is left behind.
-      if (CAPTURE_TRACE) console.warn('[CN-CAP] screenshot failure:', e);
       setStatus('Screenshot failed \u2014 check that this tab is capturable.');
       setTimeout(() => setStatus(''), 4000);
     } finally {
       // No sidebar hide/restore to unwind: the sidebar was never touched. Only
-      // re-enable the buttons.
-      setCapturing(false);
+      // re-enable the buttons - UNLESS this invocation got the moment saved and
+      // then moved on to the post-save UI tail (renderMoments + scrollToLast).
+      // That tail still belongs to this capture, so the lock must survive it
+      // (CN-005 root cause: the tail can't interleave with a second capture)
+      // and is released only after the tail below completes.
+      if (!holdCapturingThroughTail) setCapturing(false);
     }
-    // Redraw the moments list so the new card is visible immediately.
-    renderMoments();
-    await scrollToLast();
+    // Redraw the moments list and wait until the cards are actually in the DOM.
+    // The screenshot is ALREADY saved at this point, so a UI failure here must
+    // never turn into an uncaught rejection that hides a successful save.
+    try {
+      await renderMoments();
+    } catch (error) {
+      console.warn('renderMoments failed after successful capture', error);
+    }
+    // Bring the new card into view, but ONLY when the note the screenshot
+    // landed in is still the one on screen - the user may have switched notes
+    // while the screenshot flow was running.
+    if (added && activeNoteId === targetNoteId) {
+      try {
+        await scrollToLast();
+      } catch (error) {
+        console.warn('scrollToLast failed after successful capture', error);
+      }
+    }
+    // CN-005: ONLY now - after the post-save render/scroll tail - is this
+    // invocation truly finished. Release the capture lock here (the finally
+    // above deliberately skipped it when holdCapturingThroughTail is set), so a
+    // second Screenshot click can never start while this one is still
+    // rendering/scrolling the list.
+    if (holdCapturingThroughTail) setCapturing(false);
   }
 
   // ----------------------- Views -----------------------
@@ -2062,6 +2099,15 @@ import * as ls from '../local-storage.js';
   function startRename(card, note, titleEl) {
     // Create an input box.
     const input = document.createElement('input');
+    // Make the field programmatically addressable: a unique id (one per note,
+    // never shared across cards) + a stable name, so any label[for]/form
+    // association can point at it and the a11y "id or name" rule is satisfied.
+    input.id = 'cn-note-title-' + note.id;
+    input.name = 'cn-note-title';
+    // Give the field an accessible name WITHOUT adding visible UI: the rename
+    // replaces the title text, so a floating label would be redundant chrome.
+    // aria-label is the minimal, non-visual way to name it.
+    input.setAttribute('aria-label', 'Note title');
     // Style it like an inline rename field.
     input.className = 'cn-rename-input';
     // Pre-fill it with the current title.
@@ -2467,6 +2513,17 @@ import * as ls from '../local-storage.js';
 
       // The annotation text box.
       const textarea = document.createElement('textarea');
+      // Make the field programmatically addressable: a unique id (one per
+      // moment, never shared across cards) + a stable name, so any
+      // label[for]/form association can point at it and the a11y "id or name"
+      // rule is satisfied.
+      textarea.id = 'cn-moment-annotation-' + moment.id;
+      textarea.name = 'cn-moment-annotation';
+      // Give the field an accessible name WITHOUT adding visible UI: the
+      // placeholder already tells the user what the box is for, but a
+      // placeholder is NOT a substitute for an accessible name - aria-label is
+      // the minimal, non-visual way to name it.
+      textarea.setAttribute('aria-label', 'Moment annotation');
       // Style it as the note textarea.
       textarea.className = 'cn-note-textarea';
       // Placeholder text while the box is empty.

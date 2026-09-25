@@ -416,12 +416,13 @@ test('non-ChatGPT platforms keep their full-viewport captures (shared default is
   assert.match(ADAPTER, /on-page content area/);
 });
 
-test('selection layer covers the full visible frame: a plain click saves it ALL, a drag crops', () => {
+test('the selection layer starts with NO selection: only an intentional drag creates a rectangle', () => {
   assert.doesNotMatch(SELECTOR, /clampRect/, 'no content-target confinement remains anywhere in the selector');
-  assert.match(SELECTOR, /function fullRect\(\)/, 'the whole-frame default exists');
-  assert.match(SELECTOR, /rect\.width < MIN_SIZE \|\| rect\.height < MIN_SIZE/, 'an absent drag is detected');
-  assert.match(SELECTOR, /finish\(fullRect\(\)\);/, 'a plain click saves the ENTIRE visible frame - ClipNote and all');
-  assert.match(SELECTOR, /paintSelection\(fullRect\(\)\);/, 'the whole page is selected by default when the layer opens');
+  assert.doesNotMatch(SELECTOR, /fullRect/, 'no full-viewport default selection is pre-created when the layer opens');
+  assert.match(SELECTOR, /const DRAG_THRESHOLD/, 'a small drag threshold exists so a plain click is never a selection');
+  assert.match(SELECTOR, /if \(!dragging\) \{ cancel\(\)/, 'a plain click (no drag) cancels instead of saving');
+  assert.match(SELECTOR, /rect\.width < MIN_SIZE \|\| rect\.height < MIN_SIZE/, 'an undersized rectangle is still rejected');
+  assert.match(SELECTOR, /display: 'none'/, 'the selection box starts hidden, never pre-painted over the full frame');
 });
 
 test('ChatGPT "+ Capture" crops to the conversation region; the shared Screenshot flow keeps the full visible frame', () => {
@@ -433,7 +434,7 @@ test('ChatGPT "+ Capture" crops to the conversation region; the shared Screensho
     'the conversation-region crop lives in captureChatgptMoment only, never in takeScreenshot');
   assert.doesNotMatch(SIDEBAR, /targetForOverlay/, 'no content-target selection confinement anywhere');
   assert.match(SIDEBAR, /screenshot: \{ type: 'data-url', dataUrl: contentUrl \}/, '+ Capture saves the cropped conversation image');
-  assert.match(SIDEBAR, /const cropped = await cropCapturedImage\(originalCapture, selRes\.rect, selRes\.rect\.viewport\)/,
+  assert.match(SIDEBAR, /const cropped = await cropCapturedImage\(originalCapture, selRes\.rect, selRes\.rect\.viewport\);/,
     'the shared Screenshot image is a straight crop of the full visible tab capture');
 });
 
@@ -541,7 +542,8 @@ test('the shared pipeline captures the visible tab FIRST and never hides page co
   assert.doesNotMatch(SIDEBAR, /hideHostSidebar|showHostSidebar|CN_CAPTURE_MODE|CN_CAPTURE_STATE/,
     'the sidebar no longer hides/restores/verifies a page hide - ClipNote stays mounted and is cut out by geometry instead');
   assert.match(SIDEBAR, /const frame = await captureVisibleFrame\(tab\);\s*\n\s*if \(frame\.threw\) \{/, 'capture runs before any overlay/crop work');
-  assert.match(SIDEBAR, /const frameProbe = await probeCaptureImage\(frame\.dataUrl\);/, 'the captured bitmap is validated before anything is cropped');
+  assert.match(SIDEBAR, /const frameProbe = await probeCaptureImage\(frame\.dataUrl\);/,
+    'the captured bitmap is validated before anything is cropped');
   assert.match(SIDEBAR, /the captured frame was blank\./, 'a blank/empty frame is refused loudly, never saved');
   assert.match(SIDEBAR, /No sidebar hide\/restore to unwind: the sidebar was never touched/, 'finally only re-arms the buttons');
 });

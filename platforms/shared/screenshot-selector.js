@@ -9,12 +9,12 @@
 // of capture - the live page (video, animations, UI) may keep running
 // underneath but it is never visible and never part of the selection.
 //
-// By default the ENTIRE visible frame is selected: a plain click (no drag)
-// saves the full page EXACTLY as it was on screen, ClipNote and all. Dragging
-// crops the saved image to the dragged rectangle. The area outside the
-// rectangle is dimmed, the rectangle itself is highlighted with a live size
-// readout. The layer is torn down when the drag ends, on Escape, or when the
-// window loses focus.
+// The selection starts EMPTY: nothing is pre-selected when the layer opens. A
+// plain click (no drag) cancels the screenshot and restores the page; only an
+// intentional drag that passes a small threshold creates the selection
+// rectangle. The area outside the rectangle is dimmed, the rectangle itself is
+// highlighted with a live size readout. The layer is torn down when the drag
+// ends, on Escape, or when the window loses focus.
 //
 // The overlay sits above EVERYTHING on the host page and swallows pointer,
 // wheel and key events for its whole lifetime, so the video can never be
@@ -36,6 +36,11 @@
   // The smallest drag (in CSS px) that counts as a real selection.
   const MIN_SIZE = 8;
 
+  // How far the pointer must move (per axis, CSS px) before a press becomes a
+  // drag. Movement below this is a plain click, which cancels instead of ever
+  // creating a selection rectangle.
+  const DRAG_THRESHOLD = 6;
+
   // The live DOM state of the selection layer.
   let overlay = null;
   let box = null;
@@ -44,6 +49,7 @@
 
   // Drag bookkeeping.
   let selecting = false;
+  let dragging = false;
   let startX = 0;
   let startY = 0;
   let curX = 0;
@@ -59,6 +65,11 @@
 
   // True while the selection socket is open.
   let open = false;
+
+  // The host document's overflow values before the frozen layer locked them.
+  // Restored unconditionally on teardown so the page ends exactly as it
+  // started - the lock is strictly scoped to the open selection layer.
+  let savedOverflow = null;
 
   // ----------------------- Helpers -----------------------
 
@@ -87,21 +98,10 @@
     };
   }
 
-  // The ENTIRE visible frame: the default selection. A plain click (no drag)
-  // confirms this - the whole page exactly as it was on screen, ClipNote and
-  // all - so the saved screenshot is never narrowed unless the user drags.
-  function fullRect() {
-    return {
-      x: 0,
-      y: 0,
-      width: viewportW,
-      height: viewportH,
-      viewport: { width: viewportW, height: viewportH }
-    };
-  }
-
   // Move the highlight box and its size readout to the current rectangle.
   function paintSelection(rect) {
+    box.style.display = 'block';
+    sizeLabel.style.display = 'block';
     box.style.left = `${rect.x}px`;
     box.style.top = `${rect.y}px`;
     box.style.width = `${rect.width}px`;
@@ -122,6 +122,16 @@
 
   // Remove the selection layer and every listener.
   function teardown() {
+    // Unlock the document unconditionally, before the overlay guard - the
+    // restore must happen even if the layer was already removed, so the lock
+    // can never leak past the selection.
+    if (savedOverflow) {
+      const scroller = document.documentElement || document.body;
+      scroller.style.overflow = savedOverflow.overflow;
+      scroller.style.overflowX = savedOverflow.overflowX;
+      scroller.style.overflowY = savedOverflow.overflowY;
+      savedOverflow = null;
+    }
     if (!overlay) return;
     window.removeEventListener('keydown', onKeyDown, true);
     window.removeEventListener('blur', onWindowBlur);
@@ -156,34 +166,46 @@
 
   function onPointerDown(e) {
     if (e.button !== 0 || selecting) return;
-    // Any press starts a drag anywhere on the frozen frame - the whole visible
-    // page is selectable, ClipNote column included.
+    // Any press arms a potential drag anywhere on the frozen frame - the whole
+    // visible page is selectable, ClipNote column included. Nothing is painted
+    // yet: a selection rectangle only appears once the pointer actually drags
+    // far enough to cross the threshold.
     selecting = true;
+    dragging = false;
     startX = curX = e.clientX;
     startY = curY = e.clientY;
     try { overlay.setPointerCapture(e.pointerId); } catch (err) { /* ignore */ }
-    paintSelection(currentRect());
   }
 
   function onPointerMove(e) {
     if (!selecting) return;
     curX = e.clientX;
     curY = e.clientY;
-    paintSelection(currentRect());
+    // Only an actual drag creates a selection: tiny pointer jitter stays below
+    // the threshold and is never painted as a rectangle.
+    if (!dragging &&
+        (Math.abs(curX - startX) >= DRAG_THRESHOLD ||
+         Math.abs(curY - startY) >= DRAG_THRESHOLD)) {
+      dragging = true;
+    }
+    if (dragging) paintSelection(currentRect());
   }
 
   function onPointerUp() {
     if (!selecting) return;
     selecting = false;
+    // A plain click (the pointer never dragged past the threshold) is NOT a
+    // selection: cancel and restore the page without saving anything.
+    if (!dragging) { cancel(); return; }
+    dragging = false;
     const rect = currentRect();
-    // A click without a real drag confirms the WHOLE frame: the screenshot is
-    // the entire visible tab exactly as it appeared on screen, ClipNote and
-    // all. Only a genuine drag narrows the saved image to that region.
+    // A real drag, but a rectangle still too small to count, is a stray drag:
+    // cancel rather than save a meaningless sliver.
     if (rect.width < MIN_SIZE || rect.height < MIN_SIZE) {
-      finish(fullRect());
-    } else {
-      finish(rect);
+      cancel();
+      return;
     }
+    finish(rect);
   }
 
   // Block keys that would otherwise drive the host video/scroll while the
@@ -224,17 +246,33 @@
   // ----------------------- Public API -----------------------
 
   // Open the selection layer over an IMMUTABLE captured frame. Resolves with
-  // the chosen rectangle (plus the viewport snapshot), or null when the user
-  // cancelled. If a selection is already open it is cancelled first.
+  // the chosen drag rectangle (plus the viewport snapshot), or null when the
+  // user cancelled (Escape, window blur, or a plain click that never became a
+  // drag). If a selection is already open it is cancelled first.
   //   options.backgroundImage - data URL of the tab captured by the sidebar.
   //     When present it is rendered as a full-viewport, opaque background so
   //     the live page is visually frozen for the whole selection. When absent
-  //     the layer stays transparent (legacy behaviour). The frame is the WHOLE
-  //     visible tab - ClipNote sidebar included - so the default (a plain
-  //     click) saves exactly what the user saw.
+  //     the layer stays transparent (legacy behaviour). The frame is the whole
+  //     visible tab - ClipNote sidebar included - and the full viewport is the
+  //     captured SOURCE image only, never an active selection: the user must
+  //     drag to choose the region to save.
   function start(options) {
     if (open) cancel();
     open = true;
+
+    // The document's own classic scrollbar is browser chrome - no overlay can
+    // ever cover it - so the only DOM-side way to keep it from appearing
+    // beside the frozen frame is to lock the document's overflow for the
+    // lifetime of the selection layer. The previous values are backed up and
+    // restored in teardown(), making this a strictly scoped, self-reversing
+    // lock: it never outlives the layer and never touches the page otherwise.
+    const scroller = document.documentElement || document.body;
+    savedOverflow = {
+      overflow: scroller.style.overflow,
+      overflowX: scroller.style.overflowX,
+      overflowY: scroller.style.overflowY
+    };
+    scroller.style.overflow = 'hidden';
 
     // Snapshot the viewport at open time (matches the captured tab image).
     viewportW = window.innerWidth;
@@ -288,12 +326,13 @@
       borderRadius: '6px',
       pointerEvents: 'none',
       whiteSpace: 'nowrap'
-    }, 'Click to save the whole page \u00B7 or drag to select an area \u00B7 Esc to cancel');
+    }, 'Drag to select an area \u00B7 click or Esc to cancel');
 
     // The empty highlight rectangle. The gigantic box-shadow cannot be set
     // inline, so it lives in a tiny stylesheet scoped to a marker attribute.
     box = makeEl('div', {
       position: 'absolute',
+      display: 'none',
       left: '0',
       top: '0',
       width: '0',
@@ -307,6 +346,7 @@
 
     sizeLabel = makeEl('div', {
       position: 'absolute',
+      display: 'none',
       zIndex: '4',
       background: 'rgba(0,0,0,0.78)',
       color: '#fff',
@@ -323,10 +363,9 @@
     overlay.appendChild(sizeLabel);
     (document.documentElement || document.body).appendChild(overlay);
 
-    // The whole visible frame is selected by default: a plain click keeps it,
-    // a drag narrows it. The highlight starts over the full page so the user
-    // can see exactly what a click will save - ClipNote and all.
-    paintSelection(fullRect());
+    // No selection exists yet: the box and the size readout both start hidden and
+    // only appear once the user actually drags across the threshold. The frozen
+    // captured frame stays visible, full-viewport, exactly as it was on screen.
 
     // The pairing CSS rule for the dim-outside effect.
     const style = document.createElement('style');
