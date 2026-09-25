@@ -34,9 +34,6 @@
     "https://chat.openai.com/*",
     "http://chat.openai.com/*"
   ],
-  "optional_host_permissions": [
-    "<all_urls>"
-  ],
   "content_scripts": [
     {
       "matches": [
