@@ -27,8 +27,11 @@
       '.ct-sidebar-course-content'
     ],
 
-    // Udemy's Video.js <video> element.
-    lectureVideo: ['video.vjs-tech'],
+    // Udemy's lecture <video> element. Video.js marks it "vjs-tech", but Udemy
+    // has migrated players before and the live element may carry no stable
+    // class/id, so fall back to any <video> tag. findPreferredVideo() then picks
+    // the largest LAID-OUT candidate, so a hidden/ad/preview video never wins.
+    lectureVideo: ['video.vjs-tech', 'video'],
 
     lectureTitle: ['[data-purpose="lecture-title"]'],
     goToCourse: ['[data-purpose="go-to-course"]'],

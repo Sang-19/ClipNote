@@ -127,7 +127,7 @@
   // conversation column lives in. Returns { host, ref } = the row container and
   // the direct child of it that holds the chat, or null.
   const findHost = () => {
-    const el = document.querySelector(C.selectors.main);
+    const el = C.queryFirst(C.selectors.main);
     if (!el || !el.isConnected) return null;
     let node = el;
     let parent = node.parentElement;

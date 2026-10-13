@@ -104,21 +104,29 @@
     // chrome, the left navigation rail, the composer chrome outside the area,
     // unrelated controls, or ClipNote (which mounts in a DIFFERENT element and
     // is hidden from the frame by the capture-state mechanism).
-    // Anchors on the stable DOM contract (OpenAI's own
-    // data-conversation-screenshot-content marker -> #thread -> #main) instead
-    // of generated class names that change between deploys. getBoundingClientRect() already reflects the target's current
-    // scroll offset, and because visibility:hidden keeps the sidebar's layout
-    // slot, the rectangle is identical before/during/after the capture hide.
-    // The on-page element ChatGPT marks as the conversation capture surface
-    // (stable data-* / id chain, never generated class names). Shared by the
-    // screenshot target computation and the page-scroll snapshot, so both walk
-    // the exact same DOM Truth.
+    // getBoundingClientRect() already reflects the target's current scroll
+    // offset, and because visibility:hidden keeps the sidebar's layout slot,
+    // the rectangle is identical before/during/after the capture hide.
+    //
+    // Resolution order (stable structural selectors only, never generated
+    // class names):
+    //   1. OpenAI's own screenshot marker, when present.
+    //   2. The element that physically wraps every rendered conversation turn
+    //      (derived from the stable conversation-turn markers, so it survives
+    //      OpenAI dropping/renaming the dedicated screenshot attribute).
+    //   3. The #thread column, then #main.
+    // Shared by the screenshot target computation and the page-scroll
+    // snapshot, so both walk the exact same DOM Truth.
     getContentElement() {
       const c = C.selectors;
-      return (c.conversationContent && document.querySelector(c.conversationContent))
-        || (c.thread && document.querySelector(c.thread))
-        || (c.main && document.querySelector(c.main))
-        || null;
+      let el = C.queryFirst(c.conversationContent);
+      if (el && el.isConnected) return el;
+      el = C.chat.conversationSurface ? C.chat.conversationSurface() : null;
+      if (el && el.isConnected) return el;
+      el = C.queryFirst(c.thread);
+      if (el && el.isConnected) return el;
+      el = C.queryFirst(c.main);
+      return (el && el.isConnected) ? el : null;
     }
 
     getScreenshotTarget() {

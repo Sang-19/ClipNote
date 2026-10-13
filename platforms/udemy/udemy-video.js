@@ -39,11 +39,24 @@
       return m ? m[1] : null;
     },
 
-    // Udemy's Video.js <video> element, when it is actually laid out.
+    // Udemy's lecture <video> element, when it is actually laid out. Every
+    // candidate from the selector chain is collected, and the LARGEST visible
+    // one wins - so when the player no longer exposes the Video.js "vjs-tech"
+    // class (the live element may have no stable class/id at all) the real
+    // lecture video is still found, and a hidden/ad/preview <video> can never
+    // shadow it. Returns null when nothing is laid out (the shared findVideo()
+    // loop then keeps polling / falls back to its own generic detection).
     findPreferredVideo: function () {
-      const vjs = U.queryFirst(U.selectors.lectureVideo);
-      if (vjs && vjs.offsetWidth > 0 && vjs.offsetHeight > 0) return vjs;
-      return null;
+      const seen = [];
+      for (const sel of U.selectors.lectureVideo || []) {
+        document.querySelectorAll(sel).forEach((v) => {
+          if (!seen.includes(v)) seen.push(v);
+        });
+      }
+      const visible = seen
+        .filter((v) => v.offsetWidth > 0 && v.offsetHeight > 0)
+        .sort((a, b) => (b.offsetWidth * b.offsetHeight) - (a.offsetWidth * a.offsetHeight));
+      return visible[0] || null;
     },
 
     // Fallback screenshot image when the frame cannot be drawn.

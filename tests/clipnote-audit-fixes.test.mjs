@@ -391,6 +391,7 @@ const read = (rel) => readFileSync(path.join(rootDir, rel), 'utf8');
 const CONTENT = read('contentScript.js');
 const SIDEBAR = read('sidebar/sidebar.js');
 const CHATGPT = read('platforms/chatgpt/chatgpt.js');
+const CHATGPT_SELECTORS = read('platforms/chatgpt/chatgpt-selectors.js');
 const ADAPTER = read('platforms/shared/platform-adapter.js');
 const SELECTOR = read('platforms/shared/screenshot-selector.js');
 
@@ -403,11 +404,18 @@ test('contentScript exposes the screenshot-target lookup and forwards it to the 
 
 test('ChatGPT adapter defines a screenshot target on stable selectors, never generated classes', () => {
   assert.match(CHATGPT, /getScreenshotTarget\(\)/);
-  assert.match(CHATGPT, /data-conversation-screenshot-content/);
-  assert.match(CHATGPT, /#thread/);
-  assert.match(CHATGPT, /#main/);
+  // The selector chains live in the single-source-of-truth selectors module.
+  assert.match(CHATGPT_SELECTORS, /data-conversation-screenshot-content/);
+  assert.match(CHATGPT_SELECTORS, /'#thread'/);
+  assert.match(CHATGPT_SELECTORS, /'#main'/);
+  // The resilient fallback derives the surface from the stable turn markers.
+  assert.match(CHATGPT_SELECTORS, /conversationSurface/);
+  assert.match(CHATGPT_SELECTORS, /data-testid\^="conversation-turn-"/);
+  assert.match(CHATGPT, /conversationSurface/);
   assert.doesNotMatch(CHATGPT, /qMYqUG|R6Vx5W|Ejxyja|className\s*===\s*['"][A-Za-z0-9_]+['"]/,
     'screenshot target must not rely on generated Tailwind/CSS-module class names');
+  assert.doesNotMatch(CHATGPT_SELECTORS, /['"]\.[A-Za-z]/,
+    'the selector chains use ids / data-* attributes only, never class selectors');
   assert.match(CHATGPT, /getBoundingClientRect\(\)/, 'target maps CSS viewport px of the live element');
 });
 

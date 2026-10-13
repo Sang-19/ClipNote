@@ -46,7 +46,7 @@
 
     // The element ChatGPT marks as the full capture surface, when rendered.
     conversationContent: function () {
-      return document.querySelector(C.selectors.conversationContent);
+      return C.queryFirst(C.selectors.conversationContent);
     }
   };
 

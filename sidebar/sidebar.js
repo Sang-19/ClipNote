@@ -1371,20 +1371,11 @@ import * as ls from '../local-storage.js';
 
   // ----------------------- Visible-tab capture shared helpers -----------------------
 
-  // Chrome asks once for the optional <all_urls> grant the first time a page
-  // screenshot is taken. A declined grant simply aborts with a hint - nothing
-  // is captured. Shared by the selection screenshot flow and the video-less
-  // platform "Capture" path.
+  // The manifest already declares host_permissions for every supported site
+  // (YouTube, Udemy, ChatGPT), which is all chrome.tabs.captureVisibleTab
+  // needs. No additional runtime permission request is required.
   async function ensureCapturePermission() {
-    try {
-      const granted = await chrome.permissions.contains({ origins: ['<all_urls>'] });
-      if (!granted) {
-        return await chrome.permissions.request({ origins: ['<all_urls>'] });
-      }
-      return true;
-    } catch (e) {
-      return false;
-    }
+    return true;
   }
 
   // The tab that hosts THIS sidebar, brought to the front of its window so a
