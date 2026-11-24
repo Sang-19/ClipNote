@@ -1440,15 +1440,16 @@ import * as ls from '../local-storage.js';
   // returning an invalid frame, so callers can explain the failure.
   async function captureVisibleFrame(tab) {
     let dataUrl = null;
-    let threw = false;
+    let error = '';
     try {
       dataUrl = await chrome.tabs.captureVisibleTab(
         tab.windowId, { format: 'jpeg', quality: 92 });
     } catch (e) {
-      threw = true;
+      error = (e && e.message) ? e.message : String(e);
     }
     return {
-      threw,
+      threw: !!error,
+      error,
       dataUrl: (typeof dataUrl === 'string' && /^data:image\//.test(dataUrl)) ? dataUrl : null
     };
   }
@@ -1611,14 +1612,34 @@ import * as ls from '../local-storage.js';
         viewport: plan.viewport
       };
     }
-    return plan ? resolveCaptureRect(plan) : null;
+    const resolved = plan ? resolveCaptureRect(plan) : null;
+    if (resolved) return resolved;
+
+    // Some platform layouts (and responsive breakpoints) do not expose a
+    // stable content rectangle. The sidebar is hidden before pixels are taken,
+    // so a full viewport is the safe, deterministic fallback rather than
+    // failing every screenshot on pages without a measurable rail/target.
+    if (plan && plan.viewport && plan.viewport.width > 1 && plan.viewport.height > 1) {
+      return {
+        x: 0,
+        y: 0,
+        width: plan.viewport.width,
+        height: plan.viewport.height,
+        viewport: plan.viewport
+      };
+    }
+    return null;
   }
 
   async function captureContentFrame(tab, plan) {
+    if (!plan || !plan.viewport) throw new Error('Could not read the webpage viewport.');
     await setHostCaptureMode(true);
     try {
       const frame = await captureVisibleFrame(tab);
-      if (frame.threw || !frame.dataUrl) throw new Error('Could not capture the webpage viewport.');
+      if (frame.threw || !frame.dataUrl) {
+        const detail = frame.error ? ` Chrome reported: ${frame.error}` : '';
+        throw new Error(`Could not capture the webpage viewport.${detail}`);
+      }
       const probe = await probeCaptureImage(frame.dataUrl);
       if (!probe.width || !probe.height) throw new Error('The webpage screenshot was blank.');
       const rect = getContentCaptureRect(plan);
