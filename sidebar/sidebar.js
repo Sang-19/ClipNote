@@ -1447,16 +1447,25 @@ import * as ls from '../local-storage.js';
   async function captureVisibleFrame(tab) {
     let dataUrl = null;
     let error = '';
+    let timeoutId = null;
     try {
-      dataUrl = await chrome.tabs.captureVisibleTab(
-        tab.windowId, { format: 'jpeg', quality: 92 });
+      // Bound the browser API wait so a stalled capture always reaches cleanup.
+      dataUrl = await Promise.race([
+        chrome.tabs.captureVisibleTab(tab.windowId, { format: 'jpeg', quality: 92 }),
+        new Promise((_, reject) => {
+          timeoutId = setTimeout(() => reject(new Error(
+            'Chrome screenshot capture timed out after 8 seconds.')), 8000);
+        })
+      ]);
     } catch (e) {
       error = (e && e.message) ? e.message : String(e);
+    } finally {
+      if (timeoutId != null) clearTimeout(timeoutId);
     }
     return {
       threw: !!error,
       error,
-      dataUrl: (typeof dataUrl === 'string' && /^data:image\//.test(dataUrl)) ? dataUrl : null
+      dataUrl: (typeof dataUrl === 'string' && /^data:image\\//.test(dataUrl)) ? dataUrl : null
     };
   }
 
@@ -1598,13 +1607,32 @@ import * as ls from '../local-storage.js';
     return false;
   }
 
-  async function setHostCaptureMode(active) {
+  async function forceRestoreHostSidebar(tab) {
+    // Last-resort visual recovery if content-script messaging stops responding.
+    if (!tab || !Number.isInteger(tab.id) || !isAlive()) return false;
+    try {
+      await chrome.scripting.executeScript({
+        target: { tabId: tab.id, frameIds: [0] },
+        func: () => {
+          const el = document.querySelector('#cn-sidebar-container');
+          if (el) el.classList.remove('cn-capture-hidden');
+        }
+      });
+      return true;
+    } catch (e) {
+      console.warn('[ClipNote] Could not force-restore the sidebar:', e);
+      return false;
+    }
+  }
+
+  async function setHostCaptureMode(active, tab) {
     await sendToContentScript({ type: 'CN_CAPTURE_MODE', active });
     if (active) {
       const ready = await waitForCaptureState(true);
       if (!ready) throw new Error('The ClipNote sidebar could not be hidden for capture.');
     } else {
-      await waitForCaptureState(false);
+      const restored = await waitForCaptureState(false);
+      if (!restored) await forceRestoreHostSidebar(tab);
     }
   }
 
@@ -1639,7 +1667,7 @@ import * as ls from '../local-storage.js';
 
   async function captureContentFrame(tab, plan) {
     if (!plan || !plan.viewport) throw new Error('Could not read the webpage viewport.');
-    await setHostCaptureMode(true);
+    await setHostCaptureMode(true, tab);
     try {
       const frame = await captureVisibleFrame(tab);
       if (frame.threw || !frame.dataUrl) {
@@ -1654,7 +1682,7 @@ import * as ls from '../local-storage.js';
       if (!image) throw new Error('Could not crop the webpage area.');
       return { dataUrl: image, rect };
     } finally {
-      await setHostCaptureMode(false);
+      await setHostCaptureMode(false, tab);
     }
   }
 
@@ -1684,6 +1712,7 @@ import * as ls from '../local-storage.js';
   // finally; browser chrome is outside captureVisibleTab's webpage viewport.
   async function takeScreenshot() {
     if (capturing) return;
+    let screenshotTab = null;
     const targetNoteId = activeNoteId;
     if (!targetNoteId || !findNote(targetNoteId)) return;
     setCapturing(true);
@@ -1700,6 +1729,7 @@ import * as ls from '../local-storage.js';
           : (ownTab.reason || 'Could not connect to this webpage. Reload the page and try again.'));
       }
       const tab = ownTab.tab;
+      screenshotTab = tab;
       const plan = await getScreenshotTarget();
       if (!plan || !plan.viewport) {
         throw new Error('Could not read the webpage layout. Reload the page and try again.');
@@ -1712,7 +1742,11 @@ import * as ls from '../local-storage.js';
       setStatus(error && error.message ? error.message : 'Screenshot failed.');
     } finally {
       // Idempotent even if the full-page loop already restored the capture mode.
-      try { await setHostCaptureMode(false); } catch (_) { /* best effort */ }
+      try {
+        await setHostCaptureMode(false, screenshotTab);
+      } catch (_) {
+        await forceRestoreHostSidebar(screenshotTab);
+      }
       setCapturing(false);
     }
     if (added) {

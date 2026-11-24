@@ -194,7 +194,7 @@
   // Safety net: a sidebar that dies mid-capture (reload, conversation switch,
   // extension shutdown) must not leave the container hidden forever.
   let captureModeTimer = null;
-  const CAPTURE_MODE_MAX_MS = 60 * 1000;
+  const CAPTURE_MODE_MAX_MS = 15 * 1000;
   // True when a navigation/thread-swap fired while a capture was in flight.
   // The capture hides the container and freezes the platform layout, so the
   // reaction to that event is DEFERRED (see handleNavigation / setCaptureMode):
