@@ -59,6 +59,24 @@
       return visible[0] || null;
     },
 
+    // The preferred lecture <video>'s visible rectangle in CSS viewport pixels,
+    // intersected with the viewport. Udemy streams from a cross-origin CDN, so
+    // drawing the frame onto a canvas taints it and toDataURL() throws - the
+    // drawn frame can never be saved. The sidebar then shoots the VISIBLE tab
+    // and crops it to this rectangle, which yields the real displayed frame.
+    // Returns null when no video is laid out or it is fully off-screen.
+    videoRect: function () {
+      const v = U.video.findPreferredVideo();
+      if (!v || !v.isConnected) return null;
+      const r = v.getBoundingClientRect();
+      const x1 = Math.max(0, r.left);
+      const y1 = Math.max(0, r.top);
+      const x2 = Math.min(window.innerWidth, r.right);
+      const y2 = Math.min(window.innerHeight, r.bottom);
+      if (x2 - x1 <= 1 || y2 - y1 <= 1) return null;
+      return { x: x1, y: y1, width: x2 - x1, height: y2 - y1 };
+    },
+
     // Fallback screenshot image when the frame cannot be drawn.
     screenshotFallback: function (videoEl) {
       return (videoEl && videoEl.poster) || null;

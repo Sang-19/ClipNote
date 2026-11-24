@@ -1229,6 +1229,13 @@ import * as ls from '../local-storage.js';
         cap = await captureChatgptMoment();
       } else {
         cap = await captureNow();
+        // A cross-origin <video> (Udemy) taints the canvas, so the content
+        // script's drawn frame comes back as no image. Shoot the visible tab and
+        // crop it to the video rectangle so the moment still gets its real frame.
+        if (cap && (!cap.screenshot || cap.screenshot.type !== 'data-url')) {
+          const frame = await captureVisibleVideoFrame();
+          if (frame) cap.screenshot = frame;
+        }
       }
       // If we got a capture:
       if (cap) {
@@ -1522,6 +1529,41 @@ import * as ls from '../local-storage.js';
         videoId: (ctx && (ctx.videoId || ctx.conversationId)) || '',
         videoUrl: (ctx && ctx.videoUrl) || ''
       };
+    } catch (e) {
+      return null;
+    }
+  }
+
+  // Fallback frame capture for a video platform whose <video> cannot be drawn
+  // to a canvas. Udemy streams from a cross-origin CDN, which TAINTS the
+  // canvas: drawImage() succeeds but toDataURL() throws SecurityError, so the
+  // content script's drawn frame is always lost. The extension instead shoots
+  // the VISIBLE tab (which composites the real, currently displayed frame no
+  // matter where it came from) and crops the shot down to the video's own
+  // rectangle, so the saved image is exactly the lecture frame - never the
+  // browser chrome or the ClipNote sidebar. Returns a screenshot object in the
+  // same shape the capture pipeline uses, or null to keep the drawn frame /
+  // poster fallback.
+  async function captureVisibleVideoFrame() {
+    try {
+      // The video rectangle is authoritative and only video platforms that opt
+      // in expose it; without it this fallback stays out of the way entirely.
+      const plan = await getScreenshotTarget();
+      if (!plan || !plan.target) return null;
+      const rect = resolveCaptureRect(plan);
+      if (!rect) return null;
+      // Same one-time grant every visible-tab capture needs.
+      if (!(await ensureCapturePermission())) return null;
+      // Shoot OUR tab, brought to the front for captureVisibleTab.
+      const ownTab = await bringOwnTabToFront();
+      if (!ownTab.tab) return null;
+      const frame = await captureVisibleFrame(ownTab.tab);
+      if (frame.threw || !frame.dataUrl) return null;
+      // The bitmap must PROVE it has real pixels before anything is cropped.
+      const probe = await probeCaptureImage(frame.dataUrl);
+      if (!probe.width || !probe.height) return null;
+      const cropped = await cropCapturedImage(frame.dataUrl, rect, rect.viewport);
+      return { type: 'data-url', dataUrl: cropped || frame.dataUrl };
     } catch (e) {
       return null;
     }

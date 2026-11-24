@@ -50,6 +50,14 @@
       return U.video.screenshotFallback(videoEl);
     }
 
+    // The lecture video's on-screen rectangle, used as the crop target when the
+    // drawn frame cannot be saved (cross-origin canvas taint). Video platforms
+    // have no "content region" for page screenshots, so this is only consumed by
+    // the "+ Capture" visible-tab fallback, never by the shared Screenshot flow.
+    getScreenshotTarget() {
+      return U.video.videoRect();
+    }
+
     async mountSidebar(container) {
       const inFlow = await U.layout.mount(container);
       this.sidebarMounted = inFlow;
