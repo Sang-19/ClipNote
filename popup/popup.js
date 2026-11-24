@@ -96,7 +96,7 @@ async function applyToTab(enabled) {
           // Which tab to inject into.
           target: { tabId: tab.id },
           // Which files to inject.
-          files: CONTENT_SCRIPT_FILES
+          files: universalTarget ? UNIVERSAL_CONTENT_SCRIPT_FILES : BASE_CONTENT_SCRIPT_FILES
         });
       } catch (e) {
         // Injection can fail for REAL reasons: a restricted page (chrome://,
