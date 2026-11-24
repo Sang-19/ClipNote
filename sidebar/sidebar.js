@@ -853,7 +853,16 @@ import * as ls from '../local-storage.js';
   function getOwnTabId() {
     if (ownTabId != null) return Promise.resolve(ownTabId);
     if (!ownTabResolve) {
-      ownTabResolve = resolveOwnTabId().then((id) => { ownTabId = id; return id; });
+      ownTabResolve = resolveOwnTabId().then((id) => {
+        ownTabId = Number.isInteger(id) ? id : null;
+        // A null result can be a temporary startup/permission race. Do not
+        // memoize failure: the next Screenshot or Capture action retries.
+        if (ownTabId == null) ownTabResolve = null;
+        return ownTabId;
+      }).catch((error) => {
+        ownTabResolve = null;
+        throw error;
+      });
     }
     return ownTabResolve;
   }
@@ -1639,95 +1648,9 @@ import * as ls from '../local-storage.js';
     return true;
   }
 
-  async function chooseScreenshotMode() {
-    const select = $('#cn-shot-mode');
-    return (select && ['visible', 'area', 'full'].includes(select.value)) ? select.value : 'visible';
-  }
-
   async function captureVisiblePage(tab, plan, noteId) {
     const frame = await captureContentFrame(tab, plan);
     await saveScreenshotMoment(frame.dataUrl, noteId, plan.platform);
-  }
-
-  async function captureSelectedArea(tab, plan, noteId) {
-    const frame = await captureContentFrame(tab, plan);
-    const preview = await resizeDataUrl(frame.dataUrl, 1920, 0.82);
-    const rect = await sendToContentScript({
-      type: 'CN_SCREENSHOT_SELECT',
-      dataUrl: preview,
-      target: { x: 0, y: 0, width: window.innerWidth, height: window.innerHeight }
-    });
-    if (!rect || !rect.ok || !rect.rect) {
-      if (rect && rect.cancelled) return false;
-      throw new Error((rect && rect.error) || 'Area selection was cancelled.');
-    }
-    // The captured source is already clipped to webpage pixels. Translate the
-    // selector's crop by the original host-page origin before cropping.
-    const crop = {
-      x: rect.rect.x * (frame.rect.width / rect.rect.viewport.width),
-      y: rect.rect.y * (frame.rect.height / rect.rect.viewport.height),
-      width: rect.rect.width * (frame.rect.width / rect.rect.viewport.width),
-      height: rect.rect.height * (frame.rect.height / rect.rect.viewport.height),
-      viewport: { width: frame.rect.width, height: frame.rect.height }
-    };
-    const selected = await cropCapturedImage(frame.dataUrl, crop, crop.viewport);
-    if (!selected) throw new Error('Could not crop the selected webpage area.');
-    await saveScreenshotMoment(selected, noteId, plan.platform);
-    return true;
-  }
-
-  async function captureFullPage(tab, plan, noteId) {
-    // Full-page capture is implemented for the document/window scroller. Sites
-    // with nested application scrollers must expose a stable page root instead
-    // of silently producing an incomplete stitched image.
-    const root = document.documentElement;
-    const pageWidth = Math.min(root.scrollWidth, window.innerWidth);
-    const pageHeight = Math.max(root.scrollHeight, document.body ? document.body.scrollHeight : 0);
-    if (!pageWidth || !pageHeight) throw new Error('The full webpage dimensions are unavailable.');
-    const originalX = window.scrollX;
-    const originalY = window.scrollY;
-    const columns = [];
-    let stitched = null;
-    try {
-      const contentRect = getContentCaptureRect(plan);
-      if (!contentRect) throw new Error('Could not determine the webpage area to capture.');
-      const step = Math.max(1, window.innerHeight);
-      const maxTiles = Math.ceil(pageHeight / step);
-      if (maxTiles > 40) throw new Error('This page is too long to capture safely in one image.');
-      for (let index = 0; index < maxTiles; index++) {
-        const y = Math.min(index * step, Math.max(0, pageHeight - window.innerHeight));
-        window.scrollTo(0, y);
-        await new Promise(resolve => setTimeout(resolve, 120));
-        const tilePlan = await getScreenshotTarget();
-        const tile = await captureContentFrame(tab, tilePlan || plan);
-        columns.push({ dataUrl: tile.dataUrl, y });
-      }
-      const images = await Promise.all(columns.map(tile => loadImage(tile.dataUrl)));
-      const scale = images[0].naturalWidth / Math.max(1, contentRect.width);
-      const width = Math.round(contentRect.width * scale);
-      const height = Math.round(pageHeight * scale);
-      if (width * height > 64 * 1024 * 1024) throw new Error('The full-page image exceeds the safe size limit.');
-      const canvas = document.createElement('canvas');
-      canvas.width = width;
-      canvas.height = height;
-      const ctx = canvas.getContext('2d');
-      images.forEach((img, index) => {
-        const destY = Math.round(columns[index].y * scale);
-        const remaining = height - destY;
-        if (remaining <= 0) return;
-        // The last tile may overlap the previous tile when the document height
-        // is not an exact multiple of the viewport. Draw only its uncovered tail.
-        const sourceY = index === 0 ? 0 : Math.max(0, Math.round((columns[index - 1].y + window.innerHeight - columns[index].y) * scale));
-        const sourceHeight = Math.min(img.naturalHeight - sourceY, remaining);
-        if (sourceHeight > 0) ctx.drawImage(img, 0, sourceY, img.naturalWidth, sourceHeight, 0, destY + sourceY, width, sourceHeight);
-      });
-      stitched = canvas.toDataURL('image/jpeg', 0.9);
-    } finally {
-      window.scrollTo(originalX, originalY);
-      await setHostCaptureMode(false);
-    }
-    if (!stitched) throw new Error('Could not stitch the full-page screenshot.');
-    await saveScreenshotMoment(stitched, noteId, plan.platform);
   }
 
   // Every capture hides the sidebar before taking pixels and restores it in
@@ -1738,29 +1661,25 @@ import * as ls from '../local-storage.js';
     if (!targetNoteId || !findNote(targetNoteId)) return;
     setCapturing(true);
     let added = false;
-    let mode = 'visible';
     try {
       if (!(await ensureCapturePermission())) {
         setStatus('Screenshot permission was not granted.');
         return;
       }
       const ownTab = await bringOwnTabToFront();
-      if (!ownTab.tab) throw new Error('Could not connect to the webpage tab.');
+      if (!ownTab.tab) {
+        throw new Error(ownTab.activateFailed
+          ? 'Could not activate the webpage tab. Please try again.'
+          : 'Could not connect to this webpage. Reload the page and try again.');
+      }
       const tab = ownTab.tab;
       const plan = await getScreenshotTarget();
-      if (!plan || !plan.viewport) throw new Error('Could not read the webpage layout.');
-      mode = await chooseScreenshotMode();
-      if (mode === 'visible') {
-        await captureVisiblePage(tab, plan, targetNoteId);
-        added = true;
-      } else if (mode === 'area') {
-        added = await captureSelectedArea(tab, plan, targetNoteId);
-      } else {
-        await captureFullPage(tab, plan, targetNoteId);
-        added = true;
+      if (!plan || !plan.viewport) {
+        throw new Error('Could not read the webpage layout. Reload the page and try again.');
       }
+      await captureVisiblePage(tab, plan, targetNoteId);
+      added = true;
       if (added) setStatus('Screenshot saved');
-      else setStatus('Screenshot cancelled');
     } catch (error) {
       console.error('[ClipNote] Screenshot failed:', error);
       setStatus(error && error.message ? error.message : 'Screenshot failed.');
