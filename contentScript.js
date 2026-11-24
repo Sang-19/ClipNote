@@ -897,7 +897,7 @@
             // or timestamp, so those steps are skipped and the Moment carries
             // the real wall clock instead of a fake video position.
             let ts = 0;
-            if (needsVideo()) {
+            if (needsVideo() && (adapter && adapter.platform) !== 'universal') {
               ts = currentVideoTime();
               if (ts == null) {
                 videoEl = await findVideo(2000);
@@ -932,7 +932,7 @@
               : null;
             const rect = await CN.ScreenshotSelector.start({
               backgroundImage: msg.dataUrl,
-              target
+              target: target || undefined
             });
             // The 3-second window of the overlay is enough for navigation: if
             // the page moved on, never create a Moment against the new video.

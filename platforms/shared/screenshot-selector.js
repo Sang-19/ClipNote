@@ -168,10 +168,10 @@
     // visible page is selectable, ClipNote column included. Nothing is painted
     // yet: a selection rectangle only appears once the pointer actually drags
     // far enough to cross the threshold.
-    selecting = true;
-    dragging = false;
     if (e.clientX < selectionBounds.x || e.clientX > selectionBounds.x + selectionBounds.width ||
         e.clientY < selectionBounds.y || e.clientY > selectionBounds.y + selectionBounds.height) return;
+    selecting = true;
+    dragging = false;
     startX = curX = e.clientX;
     startY = curY = e.clientY;
     try { overlay.setPointerCapture(e.pointerId); } catch (err) { /* ignore */ }

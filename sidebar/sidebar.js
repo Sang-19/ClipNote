@@ -1607,15 +1607,19 @@ import * as ls from '../local-storage.js';
 
   async function captureContentFrame(tab, plan) {
     await setHostCaptureMode(true);
-    const frame = await captureVisibleFrame(tab);
-    if (frame.threw || !frame.dataUrl) throw new Error('Could not capture the webpage viewport.');
-    const probe = await probeCaptureImage(frame.dataUrl);
-    if (!probe.width || !probe.height) throw new Error('The webpage screenshot was blank.');
-    const rect = getContentCaptureRect(plan);
-    if (!rect) throw new Error('Could not determine the webpage area to capture.');
-    const image = await cropCapturedImage(frame.dataUrl, rect, rect.viewport);
-    if (!image) throw new Error('Could not crop the webpage area.');
-    return { dataUrl: image, rect };
+    try {
+      const frame = await captureVisibleFrame(tab);
+      if (frame.threw || !frame.dataUrl) throw new Error('Could not capture the webpage viewport.');
+      const probe = await probeCaptureImage(frame.dataUrl);
+      if (!probe.width || !probe.height) throw new Error('The webpage screenshot was blank.');
+      const rect = getContentCaptureRect(plan);
+      if (!rect) throw new Error('Could not determine the webpage area to capture.');
+      const image = await cropCapturedImage(frame.dataUrl, rect, rect.viewport);
+      if (!image) throw new Error('Could not crop the webpage area.');
+      return { dataUrl: image, rect };
+    } finally {
+      await setHostCaptureMode(false);
+    }
   }
 
   async function saveScreenshotMoment(dataUrl, targetNoteId, platform) {
@@ -1651,7 +1655,7 @@ import * as ls from '../local-storage.js';
     const rect = await sendToContentScript({
       type: 'CN_SCREENSHOT_SELECT',
       dataUrl: preview,
-      target: { x: 0, y: 0, width: frame.rect.width, height: frame.rect.height }
+      target: { x: 0, y: 0, width: window.innerWidth, height: window.innerHeight }
     });
     if (!rect || !rect.ok || !rect.rect) {
       if (rect && rect.cancelled) return false;
@@ -1660,10 +1664,10 @@ import * as ls from '../local-storage.js';
     // The captured source is already clipped to webpage pixels. Translate the
     // selector's crop by the original host-page origin before cropping.
     const crop = {
-      x: rect.rect.x,
-      y: rect.rect.y,
-      width: rect.rect.width,
-      height: rect.rect.height,
+      x: rect.rect.x * (frame.rect.width / rect.rect.viewport.width),
+      y: rect.rect.y * (frame.rect.height / rect.rect.viewport.height),
+      width: rect.rect.width * (frame.rect.width / rect.rect.viewport.width),
+      height: rect.rect.height * (frame.rect.height / rect.rect.viewport.height),
       viewport: { width: frame.rect.width, height: frame.rect.height }
     };
     const selected = await cropCapturedImage(frame.dataUrl, crop, crop.viewport);
@@ -1678,13 +1682,15 @@ import * as ls from '../local-storage.js';
     // of silently producing an incomplete stitched image.
     const root = document.documentElement;
     const pageWidth = Math.min(root.scrollWidth, window.innerWidth);
-    const pageHeight = root.scrollHeight;
+    const pageHeight = Math.max(root.scrollHeight, document.body ? document.body.scrollHeight : 0);
     if (!pageWidth || !pageHeight) throw new Error('The full webpage dimensions are unavailable.');
     const originalX = window.scrollX;
     const originalY = window.scrollY;
     const columns = [];
     let stitched = null;
     try {
+      const contentRect = getContentCaptureRect(plan);
+      if (!contentRect) throw new Error('Could not determine the webpage area to capture.');
       const step = Math.max(1, window.innerHeight);
       const maxTiles = Math.ceil(pageHeight / step);
       if (maxTiles > 40) throw new Error('This page is too long to capture safely in one image.');
@@ -1692,12 +1698,13 @@ import * as ls from '../local-storage.js';
         const y = Math.min(index * step, Math.max(0, pageHeight - window.innerHeight));
         window.scrollTo(0, y);
         await new Promise(resolve => setTimeout(resolve, 120));
-        const tile = await captureContentFrame(tab, plan);
+        const tilePlan = await getScreenshotTarget();
+        const tile = await captureContentFrame(tab, tilePlan || plan);
         columns.push({ dataUrl: tile.dataUrl, y });
       }
       const images = await Promise.all(columns.map(tile => loadImage(tile.dataUrl)));
-      const scale = images[0].naturalWidth / Math.max(1, getContentCaptureRect(plan).width);
-      const width = Math.round(getContentCaptureRect(plan).width * scale);
+      const scale = images[0].naturalWidth / Math.max(1, contentRect.width);
+      const width = Math.round(contentRect.width * scale);
       const height = Math.round(pageHeight * scale);
       if (width * height > 64 * 1024 * 1024) throw new Error('The full-page image exceeds the safe size limit.');
       const canvas = document.createElement('canvas');
@@ -1707,7 +1714,12 @@ import * as ls from '../local-storage.js';
       images.forEach((img, index) => {
         const destY = Math.round(columns[index].y * scale);
         const remaining = height - destY;
-        if (remaining > 0) ctx.drawImage(img, 0, 0, img.naturalWidth, Math.min(img.naturalHeight, remaining), 0, destY, width, Math.min(img.naturalHeight, remaining));
+        if (remaining <= 0) return;
+        // The last tile may overlap the previous tile when the document height
+        // is not an exact multiple of the viewport. Draw only its uncovered tail.
+        const sourceY = index === 0 ? 0 : Math.max(0, Math.round((columns[index - 1].y + window.innerHeight - columns[index].y) * scale));
+        const sourceHeight = Math.min(img.naturalHeight - sourceY, remaining);
+        if (sourceHeight > 0) ctx.drawImage(img, 0, sourceY, img.naturalWidth, sourceHeight, 0, destY + sourceY, width, sourceHeight);
       });
       stitched = canvas.toDataURL('image/jpeg', 0.9);
     } finally {
