@@ -62,7 +62,7 @@ async function applyToTab(enabled) {
     // loaded. Order matters: the shared adapter and the platform modules must
     // run before contentScript.js (which asks the adapter registry for the
     // active platform).
-    const CONTENT_SCRIPT_FILES = [
+    const BASE_CONTENT_SCRIPT_FILES = [
       'platforms/shared/platform-adapter.js',
       'platforms/udemy/udemy-selectors.js',
       'platforms/udemy/udemy-layout.js',
@@ -81,27 +81,31 @@ async function applyToTab(enabled) {
       'platforms/shared/screenshot-selector.js',
       'contentScript.js'
     ];
-    if (enabled && isSupportedSite(tab.url)) {
-      // Try to inject the content scripts into the page.
+    let universalTarget = false;
+    try {
+      const parsed = new URL(tab.url);
+      const blocked = ['youtube.com','www.youtube.com','m.youtube.com','udemy.com','www.udemy.com','chatgpt.com','www.chatgpt.com','chat.openai.com'];
+      universalTarget = /^https?:$/.test(parsed.protocol) && !blocked.includes(parsed.hostname.toLowerCase());
+    } catch (e) { /* browser-internal pages are not supported */ }
+    const UNIVERSAL_CONTENT_SCRIPT_FILES = [
+      'platforms/shared/platform-adapter.js',
+      'platforms/universal/universal-layout.js',
+      'platforms/universal/universal.js',
+      'platforms/shared/screenshot-selector.js',
+      'contentScript.js'
+    ];
+    if (enabled && (isSupportedSite(tab.url) || universalTarget)) {
+      // Load only the dedicated adapter set on dedicated platforms. Universal
+      // gets its own isolated module set and never loads the three platform adapters.
       try {
         await chrome.scripting.executeScript({
-          // Which tab to inject into.
           target: { tabId: tab.id },
-          // Which files to inject.
-          files: CONTENT_SCRIPT_FILES
+          files: universalTarget ? UNIVERSAL_CONTENT_SCRIPT_FILES : BASE_CONTENT_SCRIPT_FILES
         });
       } catch (e) {
-        // Injection can fail for REAL reasons: a restricted page (chrome://,
-        // the web store), a blocked host, a tab that just died, or the whole
-        // extension context being invalidated after an update/reload. Serving
-        // on our own pages (storage/storage.html) it is expected; elsewhere it
-        // is a genuine error and is logged - not silently swallowed as if the
-        // scripts had already been injected.
         const text = String((e && e.message) || e);
         const benign = /already been injected|already.*running|No work to do/i.test(text);
-        if (!benign) {
-          console.warn('[ClipNote] Could not inject content scripts:', text);
-        }
+        if (!benign) console.warn('[ClipNote] Could not inject content scripts:', text);
       }
     }
 
