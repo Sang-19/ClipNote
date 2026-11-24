@@ -47,6 +47,38 @@ async function requestUniversalPermission(url) {
   if (await hasUniversalPermission(url)) return true;
   return chrome.permissions.request({ origins: [pattern] });
 }
+// Register Universal scripts for this exact permitted host so Chrome injects
+// ClipNote again after full document navigations (not only SPA URL changes).
+// The global OFF switch removes all of these registrations.
+const UNIVERSAL_REGISTRATION_PREFIX = 'clipnote-universal-';
+function universalRegistrationId(url) {
+  const u = new URL(url);
+  return UNIVERSAL_REGISTRATION_PREFIX + u.protocol.replace(':', '-') + '-' + u.hostname.replace(/[^a-z0-9_-]/gi, '-');
+}
+async function syncUniversalRegistrations(enabled, url) {
+  if (!chrome.scripting.getRegisteredContentScripts || !chrome.scripting.registerContentScripts) return;
+  if (enabled && url) {
+    const u = new URL(url);
+    const id = universalRegistrationId(url);
+    const existing = await chrome.scripting.getRegisteredContentScripts({ ids: [id] });
+    if (!existing.length) {
+      await chrome.scripting.registerContentScripts([{
+        id,
+        matches: [`${u.protocol}//${u.hostname}/*`],
+        js: UNIVERSAL_FILES,
+        runAt: 'document_idle',
+        persistAcrossSessions: true
+      }]);
+    }
+    return;
+  }
+  const registrations = await chrome.scripting.getRegisteredContentScripts();
+  const ids = registrations
+    .filter(script => script.id.startsWith(UNIVERSAL_REGISTRATION_PREFIX))
+    .map(script => script.id);
+  if (ids.length) await chrome.scripting.unregisterContentScripts({ ids });
+}
+
 async function applyToTab(enabled, tab) {
   if (!tab || !tab.id) return;
   const platform = platformFor(tab.url || '');
@@ -92,6 +124,13 @@ async function init() {
             setHint('Site access was not granted. ClipNote remains OFF.');
             return;
           }
+        }
+        // Persist Universal injection for full-page navigation on this host.
+        // Turning ClipNote OFF clears all Universal registrations.
+        if (next && tab && platformFor(tab.url || '') === 'universal') {
+          await syncUniversalRegistrations(true, tab.url);
+        } else if (!next) {
+          await syncUniversalRegistrations(false);
         }
         await new Promise(resolve => chrome.storage.local.set({ clipnote_enabled: next }, resolve));
         currentEnabled = next;
