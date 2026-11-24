@@ -634,7 +634,7 @@ test('Screenshot saves the full visible tab including ClipNote without hiding or
   const captureBody = SIDEBAR.slice(start, end);
   assert.match(captureBody, /const frame = await captureVisibleFrame\(tab\);/,
     'Screenshot captures the visible tab directly');
-  assert.match(captureBody, /saveScreenshotMoment\(frame\\.dataUrl, noteId, plan\\.platform\)/,
+  assert.match(captureBody, /saveScreenshotMoment\(frame\.dataUrl, noteId, plan\.platform\)/,
     'the complete unmodified frame is saved');
   assert.doesNotMatch(captureBody, /captureContentFrame|cropCapturedImage|setHostCaptureMode/,
     'Screenshot does not hide the sidebar or crop it out');
