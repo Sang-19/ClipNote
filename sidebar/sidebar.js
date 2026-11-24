@@ -1688,16 +1688,19 @@ import * as ls from '../local-storage.js';
     }
   }
 
-  async function saveScreenshotMoment(dataUrl, targetNoteId, platform) {
+  async function saveScreenshotMoment(dataUrl, targetNoteId, details = {}) {
     const probe = await probeCaptureImage(dataUrl);
     if (!probe.width || !probe.height) throw new Error('The screenshot image was invalid.');
+    const platform = details.platform || 'universal';
     const cap = {
       id: uuid(),
       screenshot: { type: 'data-url', dataUrl },
       annotation: '',
-      platform: platform || 'universal',
-      videoId: '',
-      videoUrl: location.href
+      platform,
+      videoId: details.videoId || '',
+      videoUrl: details.videoUrl || location.href,
+      timestamp: Number.isFinite(details.timestamp) ? details.timestamp : 0,
+      humanTime: details.humanTime || ''
     };
     const added = await addCaptureToNote(cap, targetNoteId);
     if (!added) throw new Error('The note was deleted while the screenshot was being saved.');
@@ -1705,10 +1708,9 @@ import * as ls from '../local-storage.js';
     return true;
   }
 
-  // Screenshot captures the complete visible webpage viewport exactly as
-  // Chrome displays it, including the ClipNote sidebar. Do not enter capture
-  // mode, hide the sidebar, or crop the frame: the user explicitly wants the
-  // sidebar to remain visible and included in the saved screenshot.
+  // Screenshot opens a frozen, full-viewport selection layer. The captured
+  // source frame includes ClipNote; the user chooses exactly which rectangle
+  // to save by dragging, just like the native snipping-tool interaction.
   async function captureVisiblePage(tab, plan, noteId) {
     const frame = await captureVisibleFrame(tab);
     if (frame.threw || !frame.dataUrl) {
@@ -1719,14 +1721,32 @@ import * as ls from '../local-storage.js';
     if (!probe.width || !probe.height) {
       throw new Error('The visible webpage screenshot was blank.');
     }
-    await saveScreenshotMoment(frame.dataUrl, noteId, plan.platform);
+
+    // The content script freezes the captured pixels over the page and returns
+    // the user's drag rectangle. The overlay is cancellable with Escape or a
+    // click; cancellation must never create an empty Moment.
+    const selection = await sendToContentScript({
+      type: 'CN_SCREENSHOT_SELECT',
+      dataUrl: await resizeDataUrl(frame.dataUrl, 1920, 0.88)
+    });
+    if (!selection || !selection.ok) {
+      if (selection && selection.cancelled) return false;
+      throw new Error((selection && selection.error) || 'Screenshot selection could not be opened.');
+    }
+
+    const rect = selection.rect;
+    if (!rect || !rect.viewport) throw new Error('The selected screenshot area was invalid.');
+    const cropped = await cropCapturedImage(frame.dataUrl, rect, rect.viewport);
+    if (!cropped) throw new Error('Could not crop the selected screenshot area.');
+    await saveScreenshotMoment(cropped, noteId, selection);
+    return true;
   }
 
-  // The Screenshot action deliberately leaves ClipNote visible. The captured
-  // frame includes the sidebar, matching the user's on-screen view.
+  // Screenshot captures the visible tab, then lets the user drag-select the
+  // exact region to save. ClipNote stays visible in the frozen preview and can
+  // be included in the selection if the user drags across it.
   async function takeScreenshot() {
     if (capturing) return;
-    let screenshotTab = null;
     const targetNoteId = activeNoteId;
     if (!targetNoteId || !findNote(targetNoteId)) return;
     setCapturing(true);
@@ -1742,21 +1762,19 @@ import * as ls from '../local-storage.js';
           ? 'Could not activate the webpage tab. Please try again.'
           : (ownTab.reason || 'Could not connect to this webpage. Reload the page and try again.'));
       }
-      const tab = ownTab.tab;
-      screenshotTab = tab;
       const plan = await getScreenshotTarget();
       if (!plan || !plan.viewport) {
         throw new Error('Could not read the webpage layout. Reload the page and try again.');
       }
-      await captureVisiblePage(tab, plan, targetNoteId);
-      added = true;
+      added = await captureVisiblePage(ownTab.tab, plan, targetNoteId);
       if (added) setStatus('Screenshot saved');
+      else setStatus('Screenshot cancelled');
     } catch (error) {
       console.error('[ClipNote] Screenshot failed:', error);
       setStatus(error && error.message ? error.message : 'Screenshot failed.');
     } finally {
-      // Screenshot never changes sidebar visibility, so there is no capture
-      // mode to unwind. Only re-enable the Screenshot button.
+      // The selection layer owns its own teardown; Screenshot never hides or
+      // repositions the ClipNote sidebar.
       setCapturing(false);
     }
     if (added) {
