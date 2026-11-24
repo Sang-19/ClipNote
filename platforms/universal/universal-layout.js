@@ -54,6 +54,12 @@
       if (!this.isSupportedPage()) return false;
       if (this.sidebarMounted && this.container === container && container.isConnected) return true;
       this.container = container;
+      // The shared content script passes a detached container to the adapter.
+      // Attach it before returning success; otherwise the iframe exists only
+      // in memory and Universal appears missing on ordinary webpages.
+      if (!container.isConnected) {
+        (document.documentElement || document.body).appendChild(container);
+      }
       if (!this.original) {
         this.original = {
           bodyMarginRight: document.body.style.marginRight,
@@ -107,7 +113,10 @@
     }
     unmountSidebar(container) {
       const el = container || this.container;
-      if (el) el.classList.remove('cn-universal-docked');
+      if (el) {
+        el.classList.remove('cn-universal-docked');
+        if (el.isConnected) el.remove();
+      }
       document.documentElement?.classList.remove('cn-universal-active');
       document.body?.classList.remove('cn-universal-active');
       const style = document.getElementById(STYLE_ID);
