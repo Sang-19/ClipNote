@@ -1667,8 +1667,10 @@ import * as ls from '../local-storage.js';
 
   async function captureContentFrame(tab, plan) {
     if (!plan || !plan.viewport) throw new Error('Could not read the webpage viewport.');
-    await setHostCaptureMode(true, tab);
     try {
+      // Enter capture mode INSIDE the try so cleanup still runs if the hide
+      // message succeeds but the subsequent hidden-state verification fails.
+      await setHostCaptureMode(true, tab);
       const frame = await captureVisibleFrame(tab);
       if (frame.threw || !frame.dataUrl) {
         const detail = frame.error ? ` Chrome reported: ${frame.error}` : '';

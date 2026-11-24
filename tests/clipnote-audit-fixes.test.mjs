@@ -612,6 +612,19 @@ test('contentScript snapshots and restores the page scroll around a capture', ()
   assert.match(CONTENT, /if \(!active\) restoreCaptureScroll\(\);/, 'scroll is handed back when capture mode exits');
 });
 
+
+test('captureContentFrame always attempts restoration when entering capture mode fails', () => {
+  const start = SIDEBAR.indexOf('async function captureContentFrame(tab, plan)');
+  const end = SIDEBAR.indexOf('\n  async function saveScreenshotMoment', start);
+  assert.notEqual(start, -1, 'captureContentFrame exists');
+  assert.notEqual(end, -1, 'captureContentFrame boundary exists');
+  const body = SIDEBAR.slice(start, end);
+  assert.match(body, /try \\{[\\s\\S]*?await setHostCaptureMode\\(true, tab\\);[\\s\\S]*?finally \\{[\\s\\S]*?await setHostCaptureMode\\(false, tab\\);/,
+    'the hide attempt is protected by the same try/finally that restores visibility');
+  assert.doesNotMatch(body, /\\n\\s*await setHostCaptureMode\\(true, tab\\);\\s*\\n\\s*try \\{/,
+    'hide-state verification cannot fail before cleanup is armed');
+});
+
 // ---------------------------------------------------------------- report
 
 console.log(`\nclipnote-audit-fixes.test.mjs: ${passed} passed, ${failed} failed`);
