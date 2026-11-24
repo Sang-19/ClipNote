@@ -1,7 +1,7 @@
 {
   "manifest_version": 3,
   "name": "ClipNote",
-  "description": "Capture timestamped notes and screenshots from YouTube videos, Udemy lectures, and ChatGPT conversations.",
+  "description": "Capture timestamped notes and screenshots from YouTube videos, Udemy lectures, ChatGPT conversations, and webpages.",
   "version": "1.4.4",
   "icons": {
     "16": "icons/icon16.png",
@@ -80,14 +80,7 @@
         "storage/storage.js"
       ],
       "matches": [
-        "https://*.youtube.com/*",
-        "http://*.youtube.com/*",
-        "https://*.udemy.com/*",
-        "http://*.udemy.com/*",
-        "https://*.chatgpt.com/*",
-        "http://*.chatgpt.com/*",
-        "https://chat.openai.com/*",
-        "http://chat.openai.com/*"
+        "<all_urls>"
       ]
     }
   ]

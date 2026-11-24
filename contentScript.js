@@ -262,7 +262,7 @@
     if (host === 'youtube.com' || host === 'www.youtube.com' || host === 'm.youtube.com') return 'youtube';
     if (host === 'udemy.com' || host === 'www.udemy.com') return 'udemy';
     if (host === 'chatgpt.com' || host === 'www.chatgpt.com' || host === 'chat.openai.com') return 'chatgpt';
-    return null;
+    return /^https?:$/.test(location.protocol) ? 'universal' : null;
   }
 
   // The adapter registered by the matching platforms/* module for this host.
