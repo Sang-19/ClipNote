@@ -262,7 +262,7 @@
     if (host === 'youtube.com' || host === 'www.youtube.com' || host === 'm.youtube.com') return 'youtube';
     if (host === 'udemy.com' || host === 'www.udemy.com') return 'udemy';
     if (host === 'chatgpt.com' || host === 'www.chatgpt.com' || host === 'chat.openai.com') return 'chatgpt';
-    return null;
+    return 'universal';
   }
 
   // The adapter registered by the matching platforms/* module for this host.
@@ -270,7 +270,7 @@
 
   // Does the current URL hold a playable video page?
   function isWatchPage() {
-    return !!adapter && adapter.isWatchPage();
+    return !!adapter && adapter.isSupportedPage() && adapter.isWatchPage();
   }
 
   // Does the current platform play a real video? Video platforms (YouTube &
