@@ -1465,7 +1465,7 @@ import * as ls from '../local-storage.js';
     return {
       threw: !!error,
       error,
-      dataUrl: (typeof dataUrl === 'string' && /^data:image\\//.test(dataUrl)) ? dataUrl : null
+      dataUrl: (typeof dataUrl === 'string' && /^data:image\//.test(dataUrl)) ? dataUrl : null
     };
   }
 
