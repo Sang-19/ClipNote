@@ -625,6 +625,26 @@ test('captureContentFrame always attempts restoration when entering capture mode
     'hide-state verification cannot fail before cleanup is armed');
 });
 
+
+test('Screenshot saves the full visible tab including ClipNote without hiding or cropping the sidebar', () => {
+  const start = SIDEBAR.indexOf('async function captureVisiblePage(tab, plan, noteId)');
+  const end = SIDEBAR.indexOf('async function takeScreenshot()', start);
+  assert.notEqual(start, -1, 'captureVisiblePage exists');
+  assert.notEqual(end, -1, 'takeScreenshot boundary exists');
+  const captureBody = SIDEBAR.slice(start, end);
+  assert.match(captureBody, /const frame = await captureVisibleFrame\(tab\);/,
+    'Screenshot captures the visible tab directly');
+  assert.match(captureBody, /saveScreenshotMoment\(frame\.dataUrl, noteId, plan\.platform\)/,
+    'the complete unmodified frame is saved');
+  assert.doesNotMatch(captureBody, /captureContentFrame|cropCapturedImage|setHostCaptureMode/,
+    'Screenshot does not hide the sidebar or crop it out');
+  const takeStart = end;
+  const takeEnd = SIDEBAR.indexOf('\n  // ----------------------- Views', takeStart);
+  const takeBody = SIDEBAR.slice(takeStart, takeEnd);
+  assert.doesNotMatch(takeBody, /setHostCaptureMode|forceRestoreHostSidebar/,
+    'Screenshot cleanup never toggles or force-restores sidebar visibility');
+});
+
 // ---------------------------------------------------------------- report
 
 console.log(`\nclipnote-audit-fixes.test.mjs: ${passed} passed, ${failed} failed`);

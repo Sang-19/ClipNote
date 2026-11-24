@@ -1705,13 +1705,25 @@ import * as ls from '../local-storage.js';
     return true;
   }
 
+  // Screenshot captures the complete visible webpage viewport exactly as
+  // Chrome displays it, including the ClipNote sidebar. Do not enter capture
+  // mode, hide the sidebar, or crop the frame: the user explicitly wants the
+  // sidebar to remain visible and included in the saved screenshot.
   async function captureVisiblePage(tab, plan, noteId) {
-    const frame = await captureContentFrame(tab, plan);
+    const frame = await captureVisibleFrame(tab);
+    if (frame.threw || !frame.dataUrl) {
+      const detail = frame.error ? ` Chrome reported: ${frame.error}` : '';
+      throw new Error(`Could not capture the visible webpage.${detail}`);
+    }
+    const probe = await probeCaptureImage(frame.dataUrl);
+    if (!probe.width || !probe.height) {
+      throw new Error('The visible webpage screenshot was blank.');
+    }
     await saveScreenshotMoment(frame.dataUrl, noteId, plan.platform);
   }
 
-  // Every capture hides the sidebar before taking pixels and restores it in
-  // finally; browser chrome is outside captureVisibleTab's webpage viewport.
+  // The Screenshot action deliberately leaves ClipNote visible. The captured
+  // frame includes the sidebar, matching the user's on-screen view.
   async function takeScreenshot() {
     if (capturing) return;
     let screenshotTab = null;
@@ -1743,12 +1755,8 @@ import * as ls from '../local-storage.js';
       console.error('[ClipNote] Screenshot failed:', error);
       setStatus(error && error.message ? error.message : 'Screenshot failed.');
     } finally {
-      // Idempotent even if the full-page loop already restored the capture mode.
-      try {
-        await setHostCaptureMode(false, screenshotTab);
-      } catch (_) {
-        await forceRestoreHostSidebar(screenshotTab);
-      }
+      // Screenshot never changes sidebar visibility, so there is no capture
+      // mode to unwind. Only re-enable the Screenshot button.
       setCapturing(false);
     }
     if (added) {
