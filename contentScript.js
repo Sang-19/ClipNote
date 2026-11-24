@@ -1417,7 +1417,7 @@
           n === sidebarContainer || (n.contains && n.contains(sidebarContainer)))) {
           // injectSidebar() never rejects, but keep a handler anyway so a
           // future regression can never surface as an uncaught promise error.
-          if (isWatchPage()) injectSidebar().then(() => {}, (e) => console.error('[SNT] re-mount failed', e));
+          if (isWatchPage() && cnEnabled) injectSidebar().then(() => {}, (e) => console.error('[SNT] re-mount failed', e));
           else removeSidebar();
           return;
         }

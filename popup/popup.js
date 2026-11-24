@@ -62,7 +62,7 @@ async function applyToTab(enabled) {
     // loaded. Order matters: the shared adapter and the platform modules must
     // run before contentScript.js (which asks the adapter registry for the
     // active platform).
-    const CONTENT_SCRIPT_FILES = [
+    const BASE_CONTENT_SCRIPT_FILES = [
       'platforms/shared/platform-adapter.js',
       'platforms/udemy/udemy-selectors.js',
       'platforms/udemy/udemy-layout.js',
@@ -83,7 +83,7 @@ async function applyToTab(enabled) {
       'platforms/universal/universal.js',
       'contentScript.js'
     ];
-    let universalTarget = false;
+    const CONTENT_SCRIPT_FILES = isSupportedSite(tab.url) ? BASE_CONTENT_SCRIPT_FILES : [\n      'platforms/shared/platform-adapter.js',\n      'platforms/universal/universal-layout.js',\n      'platforms/universal/universal.js',\n      'platforms/shared/screenshot-selector.js',\n      'contentScript.js'\n    ];\n    let universalTarget = false;
     try {
       const parsed = new URL(tab.url);
       const blocked = ['youtube.com','www.youtube.com','m.youtube.com','udemy.com','www.udemy.com','chatgpt.com','www.chatgpt.com','chat.openai.com'];
@@ -96,7 +96,7 @@ async function applyToTab(enabled) {
           // Which tab to inject into.
           target: { tabId: tab.id },
           // Which files to inject.
-          files: universalTarget ? ['platforms/shared/platform-adapter.js','platforms/universal/universal-layout.js','platforms/universal/universal.js','platforms/shared/screenshot-selector.js','contentScript.js'] : CONTENT_SCRIPT_FILES
+          files: CONTENT_SCRIPT_FILES
         });
       } catch (e) {
         // Injection can fail for REAL reasons: a restricted page (chrome://,
