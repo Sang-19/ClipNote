@@ -262,7 +262,7 @@
     if (host === 'youtube.com' || host === 'www.youtube.com' || host === 'm.youtube.com') return 'youtube';
     if (host === 'udemy.com' || host === 'www.udemy.com') return 'udemy';
     if (host === 'chatgpt.com' || host === 'www.chatgpt.com' || host === 'chat.openai.com') return 'chatgpt';
-    return 'universal';
+    return null;
   }
 
   // The adapter registered by the matching platforms/* module for this host.
@@ -270,7 +270,7 @@
 
   // Does the current URL hold a playable video page?
   function isWatchPage() {
-    return !!adapter && adapter.isSupportedPage() && adapter.isWatchPage();
+    return !!adapter && adapter.isWatchPage();
   }
 
   // Does the current platform play a real video? Video platforms (YouTube &
@@ -1417,7 +1417,7 @@
           n === sidebarContainer || (n.contains && n.contains(sidebarContainer)))) {
           // injectSidebar() never rejects, but keep a handler anyway so a
           // future regression can never surface as an uncaught promise error.
-          if (isWatchPage() && cnEnabled) injectSidebar().then(() => {}, (e) => console.error('[SNT] re-mount failed', e));
+          if (isWatchPage()) injectSidebar().then(() => {}, (e) => console.error('[SNT] re-mount failed', e));
           else removeSidebar();
           return;
         }

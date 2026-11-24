@@ -32,7 +32,9 @@
     "https://*.chatgpt.com/*",
     "http://*.chatgpt.com/*",
     "https://chat.openai.com/*",
-    "http://chat.openai.com/*"
+    "http://chat.openai.com/*",
+    "http://*/*",
+    "https://*/*"
   ],
   "content_scripts": [
     {
@@ -80,14 +82,8 @@
         "storage/storage.js"
       ],
       "matches": [
-        "https://*.youtube.com/*",
-        "http://*.youtube.com/*",
-        "https://*.udemy.com/*",
-        "http://*.udemy.com/*",
-        "https://*.chatgpt.com/*",
-        "http://*.chatgpt.com/*",
-        "https://chat.openai.com/*",
-        "http://chat.openai.com/*"
+        "http://*/*",
+        "https://*/*"
       ]
     }
   ]
