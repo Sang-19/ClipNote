@@ -653,3 +653,28 @@ if (failed > 0) {
   for (const f of failures) console.error(`- ${f}`);
   process.exit(1);
 }
+
+
+test('Screenshot opens a drag-selection overlay and saves only the selected crop', () => {
+  const start = SIDEBAR.indexOf('async function captureVisiblePage(tab, plan, noteId)');
+  const end = SIDEBAR.indexOf('async function takeScreenshot()', start);
+  assert.notEqual(start, -1, 'captureVisiblePage exists');
+  assert.notEqual(end, -1, 'takeScreenshot boundary exists');
+  const body = SIDEBAR.slice(start, end);
+  assert.match(body, /type: 'CN_SCREENSHOT_SELECT'/, 'Screenshot asks the content script to open the selector');
+  assert.match(body, /dataUrl: await resizeDataUrl\(frame\.dataUrl/, 'the captured full frame is passed as the frozen selection background');
+  assert.match(body, /cropCapturedImage\(frame\.dataUrl, rect, rect\.viewport\)/, 'the user's selected rectangle is cropped from the original-resolution frame');
+  assert.match(body, /saveScreenshotMoment\(cropped, noteId, selection\)/, 'only the selected crop is saved');
+  assert.match(body, /if \(!selection \|\| !selection\.ok\)/, 'cancelled or failed selection does not save a Moment');
+  assert.doesNotMatch(body, /setHostCaptureMode|forceRestoreHostSidebar/, 'the sidebar is never hidden for selection');
+});
+
+test('Screenshot selection stores the selected platform and video context', () => {
+  const start = SIDEBAR.indexOf('async function saveScreenshotMoment(dataUrl, targetNoteId, details = {})');
+  const end = SIDEBAR.indexOf('async function captureVisiblePage', start);
+  const body = SIDEBAR.slice(start, end);
+  assert.match(body, /platform: details\.platform \|\| 'universal'/);
+  assert.match(body, /videoId: details\.videoId \|\| ''/);
+  assert.match(body, /timestamp: Number\.isFinite\(details\.timestamp\)/);
+  assert.match(body, /humanTime: details\.humanTime \|\| ''/);
+});
