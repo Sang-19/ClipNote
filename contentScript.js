@@ -1065,11 +1065,17 @@
             clip = { x: x1, y: y1, width: x2 - x1, height: y2 - y1 };
           }
         }
+        const viewport = { width: window.innerWidth, height: window.innerHeight };
+        let contentRect = target;
+        if (!contentRect && adapter && adapter.platform === 'universal') {
+          const right = clip ? Math.max(0, clip.x) : viewport.width;
+          contentRect = { x: 0, y: 0, width: right, height: viewport.height };
+        }
         sendResponse({
           ok: true,
-          target,
+          target: contentRect,
           clip,
-          viewport: { width: window.innerWidth, height: window.innerHeight },
+          viewport,
           platform: (adapter && adapter.platform) || ''
         });
         return;

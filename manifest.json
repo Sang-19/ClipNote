@@ -19,11 +19,8 @@
       "128": "icons/icon128.png"
     }
   },
-  "permissions": [
-    "activeTab",
-    "scripting",
-    "storage"
-  ],
+  "permissions": ["activeTab", "scripting", "storage", "tabs"],
+  "optional_host_permissions": ["http://*/*", "https://*/*"],
   "host_permissions": [
     "https://*.youtube.com/*",
     "http://*.youtube.com/*",
@@ -79,9 +76,7 @@
         "storage/storage.css",
         "storage/storage.js"
       ],
-      "matches": [
-        "<all_urls>"
-      ]
+      "matches": ["http://*/*", "https://*/*"]
     }
   ]
 }

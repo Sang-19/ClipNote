@@ -59,6 +59,7 @@
   // sidebar matches the layer coordinates exactly).
   let viewportW = 0;
   let viewportH = 0;
+  let selectionBounds = { x: 0, y: 0, width: 0, height: 0 };
 
   // The pending promise resolver (null once solved/cancelled).
   let resolver = null;
@@ -85,15 +86,12 @@
   // visible frame stays selectable everywhere, so the user can still pick a
   // region that overlaps the ClipNote column if they want it in the screenshot.
   function currentRect() {
-    const x1 = Math.max(0, Math.min(startX, curX));
-    const y1 = Math.max(0, Math.min(startY, curY));
-    const x2 = Math.min(viewportW, Math.max(startX, curX));
-    const y2 = Math.min(viewportH, Math.max(startY, curY));
+    const x1 = Math.max(selectionBounds.x, Math.min(startX, curX));
+    const y1 = Math.max(selectionBounds.y, Math.min(startY, curY));
+    const x2 = Math.min(selectionBounds.x + selectionBounds.width, Math.max(startX, curX));
+    const y2 = Math.min(selectionBounds.y + selectionBounds.height, Math.max(startY, curY));
     return {
-      x: x1,
-      y: y1,
-      width: x2 - x1,
-      height: y2 - y1,
+      x: x1, y: y1, width: x2 - x1, height: y2 - y1,
       viewport: { width: viewportW, height: viewportH }
     };
   }
@@ -172,6 +170,8 @@
     // far enough to cross the threshold.
     selecting = true;
     dragging = false;
+    if (e.clientX < selectionBounds.x || e.clientX > selectionBounds.x + selectionBounds.width ||
+        e.clientY < selectionBounds.y || e.clientY > selectionBounds.y + selectionBounds.height) return;
     startX = curX = e.clientX;
     startY = curY = e.clientY;
     try { overlay.setPointerCapture(e.pointerId); } catch (err) { /* ignore */ }
@@ -250,6 +250,8 @@
   // user cancelled (Escape, window blur, or a plain click that never became a
   // drag). If a selection is already open it is cancelled first.
   //   options.backgroundImage - data URL of the tab captured by the sidebar.
+  //   options.target - optional CSS-pixel rectangle restricting selection
+  //     to webpage content (for example, the page column beside ClipNote).
   //     When present it is rendered as a full-viewport, opaque background so
   //     the live page is visually frozen for the whole selection. When absent
   //     the layer stays transparent (legacy behaviour). The frame is the whole
@@ -277,12 +279,23 @@
     // Snapshot the viewport at open time (matches the captured tab image).
     viewportW = window.innerWidth;
     viewportH = window.innerHeight;
+    const requested = options && options.target;
+    selectionBounds = requested && Number.isFinite(requested.x) &&
+      Number.isFinite(requested.y) && Number.isFinite(requested.width) &&
+      Number.isFinite(requested.height) && requested.width > 1 && requested.height > 1
+      ? {
+          x: Math.max(0, requested.x), y: Math.max(0, requested.y),
+          width: Math.max(0, Math.min(viewportW, requested.x + requested.width) - Math.max(0, requested.x)),
+          height: Math.max(0, Math.min(viewportH, requested.y + requested.height) - Math.max(0, requested.y))
+        }
+      : { x: 0, y: 0, width: viewportW, height: viewportH };
 
     overlay = makeEl('div', {
       position: 'fixed',
-      inset: '0',
-      width: '100%',
-      height: '100%',
+      left: `${selectionBounds.x}px`,
+      top: `${selectionBounds.y}px`,
+      width: `${selectionBounds.width}px`,
+      height: `${selectionBounds.height}px`,
       zIndex: '2147483647',
       background: 'transparent',
       cursor: 'crosshair',
@@ -299,9 +312,10 @@
       // never narrowed to a content target, never re-composed.
       const bg = makeEl('div', {
         position: 'absolute',
-        inset: '0',
-        width: '100%',
-        height: '100%',
+        left: `${selectionBounds.x}px`,
+        top: `${selectionBounds.y}px`,
+        width: `${selectionBounds.width}px`,
+        height: `${selectionBounds.height}px`,
         backgroundImage: `url("${backgroundImage}")`,
         backgroundSize: '100% 100%',
         backgroundRepeat: 'no-repeat',
@@ -316,7 +330,7 @@
     hint = makeEl('div', {
       position: 'fixed',
       top: '14px',
-      left: '50%',
+      left: `${selectionBounds.x + selectionBounds.width / 2}px`,
       transform: 'translateX(-50%)',
       zIndex: '2',
       background: 'rgba(0,0,0,0.78)',

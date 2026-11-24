@@ -1,99 +1,169 @@
 // ClipNote Universal layout adapter.
-// Keeps the host page in normal document flow and reserves a right-hand column.
+// Uses a fixed-width, right-docked sidebar and reserves space without moving
+// or re-parenting arbitrary host-page nodes. A CSS body margin creates the
+// page reflow while preserving the site's DOM structure and scroll containers.
 (() => {
   'use strict';
   const NS = (window.__CN = window.__CN || {});
   if (NS.__universalLayoutLoaded) return;
   NS.__universalLayoutLoaded = true;
 
+  const STYLE_ID = 'cn-universal-layout-style';
+  const SIDEBAR_WIDTH = 360;
+
   class UniversalLayout {
     constructor() {
       this.platform = 'universal';
       this.hasVideo = false;
       this.sidebarMounted = false;
-      this.shell = null;
-      this.content = null;
       this.container = null;
-      this.originalBodyStyle = null;
-      this.originalHtmlStyle = null;
+      this.onNavigate = null;
+      this.original = null;
+      this.navObserver = null;
+      this.lastUrl = location.href;
+      this.captureFrozen = false;
     }
-    isSupportedPage() { return /^https?:$/.test(location.protocol); }
+    isSupportedPage() {
+      const host = location.hostname.toLowerCase();
+      if (!/^https?:$/.test(location.protocol)) return false;
+      if (host === 'youtube.com' || host.endsWith('.youtube.com')) return false;
+      if (host === 'udemy.com' || host.endsWith('.udemy.com')) return false;
+      if (host === 'chatgpt.com' || host.endsWith('.chatgpt.com') || host === 'chat.openai.com') return false;
+      return true;
+    }
     isWatchPage() { return this.isSupportedPage(); }
     getVideoContext() {
       return { ok: true, platform: 'universal', videoUrl: location.href, title: document.title, videoId: '' };
     }
-    getContentElement() { return this.content || document.querySelector('main') || document.body; }
+    getContentElement() {
+      return document.querySelector('main,[role="main"],article') || document.body;
+    }
     getScreenshotTarget() {
-      const node = this.content;
-      if (!node) return null;
-      const r = node.getBoundingClientRect();
-      const x = Math.max(0, r.left);
-      const y = Math.max(0, r.top);
-      const right = Math.min(window.innerWidth, r.right);
+      const el = this.getContentElement();
+      if (!el) return null;
+      const r = el.getBoundingClientRect();
+      const left = Math.max(0, r.left);
+      const top = Math.max(0, r.top);
+      const right = Math.min(window.innerWidth - SIDEBAR_WIDTH, r.right);
       const bottom = Math.min(window.innerHeight, r.bottom);
-      if (right <= x || bottom <= y) return null;
-      return { x, y, width: right - x, height: bottom - y };
+      if (right <= left || bottom <= top) return null;
+      return { x: left, y: top, width: right - left, height: bottom - top };
     }
     mountSidebar(container) {
-      if (!document.body || !container) return false;
-      if (this.sidebarMounted) return true;
+      if (!document.documentElement || !document.body || !container) return false;
+      if (!this.isSupportedPage()) return false;
+      if (this.sidebarMounted && this.container === container && container.isConnected) return true;
       this.container = container;
-      this.originalBodyStyle = document.body.getAttribute('style');
-      this.originalHtmlStyle = document.documentElement.getAttribute('style');
-
-      const shell = document.createElement('div');
-      shell.id = 'cn-universal-shell';
-      Object.assign(shell.style, {
-        display: 'flex', alignItems: 'stretch', width: '100%', minHeight: '100vh',
-        position: 'relative', isolation: 'isolate'
-      });
-      const content = document.createElement('div');
-      content.id = 'cn-universal-content';
-      Object.assign(content.style, {
-        flex: '1 1 auto', minWidth: '0', minHeight: '100vh',
-        overflow: 'auto', position: 'relative'
-      });
-      const parent = document.body;
-      const originalChildren = Array.from(parent.childNodes).filter(n => n !== container);
-      parent.insertBefore(shell, parent.firstChild);
-      shell.appendChild(content);
-      originalChildren.forEach(n => content.appendChild(n));
-      shell.appendChild(container);
-      Object.assign(parent.style, { margin: '0', padding: '0', width: '100%', minHeight: '100vh' });
-      Object.assign(container.style, {
-        display: 'block', position: 'relative', inset: 'auto', flex: '0 0 360px',
-        width: '360px', height: '100vh', minHeight: '100vh', zIndex: '2147483000',
-        border: '0', borderLeft: '1px solid rgba(0,0,0,.18)', background: '#1a1210'
-      });
-      const frame = container.querySelector('iframe');
-      if (frame) Object.assign(frame.style, { display: 'block', width: '100%', height: '100%', border: '0' });
-      this.shell = shell;
-      this.content = content;
+      if (!this.original) {
+        this.original = {
+          bodyMarginRight: document.body.style.marginRight,
+          bodyTransition: document.body.style.transition,
+          htmlOverflowX: document.documentElement.style.overflowX
+        };
+      }
+      let style = document.getElementById(STYLE_ID);
+      if (!style) {
+        style = document.createElement('style');
+        style.id = STYLE_ID;
+        style.textContent = `
+          html.cn-universal-active { overflow-x: clip !important; }
+          body.cn-universal-active {
+            box-sizing: border-box !important;
+            margin-right: ${SIDEBAR_WIDTH}px !important;
+            transition: margin-right 120ms ease-out;
+          }
+          #cn-sidebar-container.cn-universal-docked {
+            display: block !important;
+            position: fixed !important;
+            top: 0 !important;
+            right: 0 !important;
+            bottom: 0 !important;
+            left: auto !important;
+            width: ${SIDEBAR_WIDTH}px !important;
+            height: 100vh !important;
+            min-height: 100vh !important;
+            max-height: 100vh !important;
+            flex: none !important;
+            z-index: 2147483000 !important;
+            border: 0 !important;
+            border-left: 1px solid rgba(0,0,0,.18) !important;
+            background: #1a1210 !important;
+            box-sizing: border-box !important;
+          }
+          #cn-sidebar-container.cn-universal-docked iframe {
+            display: block !important;
+            width: 100% !important;
+            height: 100% !important;
+            border: 0 !important;
+          }
+        `;
+        (document.head || document.documentElement).appendChild(style);
+      }
+      document.documentElement.classList.add('cn-universal-active');
+      document.body.classList.add('cn-universal-active');
+      container.classList.add('cn-universal-docked');
       this.sidebarMounted = true;
       return true;
     }
     unmountSidebar(container) {
-      const shell = this.shell;
-      const content = this.content;
-      if (shell && shell.isConnected && content) {
-        while (content.firstChild) shell.parentNode.insertBefore(content.firstChild, shell);
-        shell.remove();
-      } else if (container && container.isConnected) {
-        container.remove();
+      const el = container || this.container;
+      if (el) el.classList.remove('cn-universal-docked');
+      document.documentElement?.classList.remove('cn-universal-active');
+      document.body?.classList.remove('cn-universal-active');
+      const style = document.getElementById(STYLE_ID);
+      if (style) style.remove();
+      if (this.original && document.body) {
+        document.body.style.marginRight = this.original.bodyMarginRight;
+        document.body.style.transition = this.original.bodyTransition;
       }
-      if (document.body && this.originalBodyStyle === null) document.body.removeAttribute('style');
-      else if (document.body && this.originalBodyStyle !== null) document.body.setAttribute('style', this.originalBodyStyle);
-      if (document.documentElement && this.originalHtmlStyle === null) document.documentElement.removeAttribute('style');
-      else if (document.documentElement && this.originalHtmlStyle !== null) document.documentElement.setAttribute('style', this.originalHtmlStyle);
-      this.shell = null; this.content = null; this.container = null; this.sidebarMounted = false;
+      if (this.original && document.documentElement) {
+        document.documentElement.style.overflowX = this.original.htmlOverflowX;
+      }
+      this.container = null;
+      this.original = null;
+      this.sidebarMounted = false;
     }
     applyLayout(container) {
-      if (!this.sidebarMounted || !this.shell || !this.shell.isConnected) return this.mountSidebar(container);
-      if (container && container.parentNode !== this.shell) this.shell.appendChild(container);
+      if (!this.isSupportedPage()) return false;
+      if (!this.sidebarMounted || !container?.isConnected) return this.mountSidebar(container);
+      if (container && container !== this.container) {
+        this.container?.classList.remove('cn-universal-docked');
+        this.container = container;
+        container.classList.add('cn-universal-docked');
+      }
       return true;
     }
+    setCapture(active) { this.captureFrozen = !!active; }
+    setupNavigation(callback) {
+      this.onNavigate = callback;
+      if (this.navObserver) this.navObserver.disconnect();
+      this.navObserver = new MutationObserver(() => {
+        if (this.captureFrozen) return;
+        if (location.href !== this.lastUrl) {
+          this.lastUrl = location.href;
+          this.onNavigate?.();
+        }
+      });
+      this.navObserver.observe(document.documentElement, { childList: true, subtree: true });
+      const onPop = () => {
+        if (this.captureFrozen) return;
+        if (location.href !== this.lastUrl) {
+          this.lastUrl = location.href;
+          this.onNavigate?.();
+        }
+      };
+      window.addEventListener('popstate', onPop);
+      this._onPop = onPop;
+    }
+    handleNavigation() {}
+    destroy() {
+      this.navObserver?.disconnect();
+      this.navObserver = null;
+      if (this._onPop) window.removeEventListener('popstate', this._onPop);
+      this._onPop = null;
+      this.unmountSidebar(this.container);
+    }
     restoreLayout() { this.unmountSidebar(this.container); }
-    destroy() { this.unmountSidebar(this.container); }
   }
 
   const adapter = new UniversalLayout();
