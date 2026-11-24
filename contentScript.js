@@ -1011,7 +1011,13 @@
       // the race and starve the correct answer.
       if (msg.type === 'CN_WHOAMI') {
         const token = (msg && msg.frameToken) || '';
-        const expected = (sidebarContainer && sidebarContainer.dataset && sidebarContainer.dataset.cnFrameToken) || '';
+        // The module-level reference can be stale after a host-page re-render
+        // or sidebar re-mount. Prefer the live connected container in the DOM
+        // so the iframe can still prove which tab owns it.
+        const liveContainer = (sidebarContainer && sidebarContainer.isConnected)
+          ? sidebarContainer
+          : document.querySelector('#cn-sidebar-container');
+        const expected = (liveContainer && liveContainer.dataset && liveContainer.dataset.cnFrameToken) || '';
         if (token && token === expected) {
           sendResponse({ ok: true, url: location.href });
         }

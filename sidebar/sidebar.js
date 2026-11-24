@@ -878,7 +878,7 @@ import * as ls from '../local-storage.js';
       // Find the tab that hosts THIS sidebar - never the active tab.
       const tabId = await getOwnTabId();
       // If we could not resolve our host tab, never fire blind.
-      if (!tabId) return null;
+      if (tabId == null) return null;
       // Wrap the reply in a Promise.
       return await new Promise((resolve) => {
         // Deliver ONLY to the main frame of our own tab (content scripts live
@@ -1401,7 +1401,13 @@ import * as ls from '../local-storage.js';
   // forward, so callers can show the precise error message.
   async function bringOwnTabToFront() {
     const tabId = await getOwnTabId();
-    if (!tabId) return { tab: null, activateFailed: false };
+    if (tabId == null) {
+      return {
+        tab: null,
+        activateFailed: false,
+        reason: 'ClipNote could not identify the browser tab hosting its sidebar. Close and reopen the ClipNote sidebar, then try again.'
+      };
+    }
     let tab = null;
     try {
       tab = await chrome.tabs.get(tabId);
@@ -1691,7 +1697,7 @@ import * as ls from '../local-storage.js';
       if (!ownTab.tab) {
         throw new Error(ownTab.activateFailed
           ? 'Could not activate the webpage tab. Please try again.'
-          : 'Could not connect to this webpage. Reload the page and try again.');
+          : (ownTab.reason || 'Could not connect to this webpage. Reload the page and try again.'));
       }
       const tab = ownTab.tab;
       const plan = await getScreenshotTarget();
