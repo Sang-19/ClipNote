@@ -1569,237 +1569,213 @@ import * as ls from '../local-storage.js';
     }
   }
 
-  // Run the full screenshot flow: capture the visible tab EXACTLY as-is ->
-  // freeze it -> confirm the WHOLE frame (plain click) or crop a region (drag)
-  // -> Moment.
-  // ORDER MATTERS (this is the SHARED pipeline for every platform): the visible
-  // tab is captured FIRST, exactly as the user sees it - ClipNote sidebar, AND
-  // all. The sidebar is never hidden, cropped, removed, repositioned or resized
-  // for a capture (hiding live page content first is exactly how a capture
-  // comes back blank), so the captured frame is a truthful snapshot of the
-  // screen. The frozen selection layer that follows is a static copy of that
-  // capture: a plain click saves the ENTIRE visible frame (ClipNote included)
-  // and a drag crops it - always a straight crop of the visible tab, never a
-  // re-composition. The live page can keep animating underneath but is never
-  // visible and never part of the image.
-  async function takeScreenshot() {
-    // Ignore the click if a capture or selection is already running.
-    if (capturing) return;
-    // Resolve the target note UP FRONT (before any await: the user may switch
-    // notes while the flow runs; the crop must land in the clicked note).
-    const targetNoteId = activeNoteId;
-    // Ignore it if there's no open note.
-    if (!targetNoteId || !findNote(targetNoteId)) return;
+  // Capture helpers shared by the three webpage screenshot modes.
+  async function waitForCaptureState(hidden) {
+    for (let i = 0; i < 30; i++) {
+      const state = await sendToContentScript({ type: 'CN_CAPTURE_STATE' });
+      if (state && state.ok && state.hidden === hidden) {
+        await new Promise(resolve => requestAnimationFrame(() => requestAnimationFrame(resolve)));
+        return true;
+      }
+      await new Promise(resolve => setTimeout(resolve, 50));
+    }
+    return false;
+  }
 
-    // Lock the capture buttons for the whole flow (blocks double-trigger).
-    setCapturing(true);
-    // True only when the new moment was successfully inserted into its note.
-    let added = false;
-    // Most exits release the splash lock in the finally below (clean cancel,
-    // selection failure, capture error). The one exception is a SUCCESSFUL
-    // save: the lock stays on through the post-save render/scroll tail below
-    // (CN-005) - otherwise a second click can start while the first invocation
-    // is still re-rendering and scrolling, letting two captures interleave on
-    // the same note.
-    let holdCapturingThroughTail = false;
+  async function setHostCaptureMode(active) {
+    await sendToContentScript({ type: 'CN_CAPTURE_MODE', active });
+    if (active) {
+      const ready = await waitForCaptureState(true);
+      if (!ready) throw new Error('The ClipNote sidebar could not be hidden for capture.');
+    } else {
+      await waitForCaptureState(false);
+    }
+  }
 
-    try {
-      // 0) Page screenshots need the captureVisibleTab permission. It is
-      //    requested LAZILY the first time, as an OPTIONAL (<all_urls>) grant:
-      //    a permanent requirement adds the scary "all websites" install
-      //    warning, while optional keeps the install clean and lets Chrome ask
-      //    once. Requested at the very start of the flow (closest to the user
-      //    gesture) and before any other page work, so the prompt can appear.
-      //    A declined grant simply aborts with a hint - nothing is captured.
-      if (!(await ensureCapturePermission())) {
-        setStatus('Screenshot needs one-time permission \u2014 approve it in the prompt, or in the extension\u2019s details page.');
-        setTimeout(() => setStatus(''), 5000);
-        return;
-      }
-
-      // 1) Capture the visible frame of OUR OWN tab BEFORE showing any overlay.
-      //    This is the single static frame the whole screenshot flow operates
-      //    on. captureVisibleTab only captures the ACTIVE tab of a window, so
-      //    when this sidebar lives in a background tab it is brought to the
-      //    front first - never the wrong (active) tab's page.
-      const ownTab = await bringOwnTabToFront();
-      if (!ownTab.tab) {
-        setStatus(ownTab.activateFailed
-          ? 'Couldn\u2019t bring this page to the front for the screenshot.'
-          : 'Couldn\u2019t connect to this page. Please reload it.');
-        setTimeout(() => setStatus(''), 4000);
-        return;
-      }
-      const tab = ownTab.tab;
-
-      const frame = await captureVisibleFrame(tab);
-      if (frame.threw) {
-        // captureVisibleTab threw (no permission, tab not capturable). Without
-        // a real frame we refuse to enter selection mode or fake a screenshot.
-        setStatus('Screenshot failed \u2014 check that this tab is capturable.');
-        setTimeout(() => setStatus(''), 4000);
-        return;
-      }
-      // The frame must be there AND prove it has real pixels before anything
-      // else: blank/empty bitmaps are refused loudly instead of being saved
-      // silently as a blank "screenshot".
-      if (!frame.dataUrl) {
-        // The captured frame was invalid: abort cleanly, page stays untouched.
-        setStatus('Screenshot failed \u2014 the captured frame was invalid.');
-        setTimeout(() => setStatus(''), 4000);
-        return;
-      }
-      const frameProbe = await probeCaptureImage(frame.dataUrl);
-      if (!frameProbe.width || !frameProbe.height) {
-        setStatus('Screenshot failed \u2014 the captured frame was blank.');
-        setTimeout(() => setStatus(''), 4000);
-        return;
-      }
-      // Keep the ORIGINAL full-frame capture for the final crop, but carry only
-      // a resized copy across to the content script for the frozen selection
-      // layer so the message never exceeds Chrome's size limit. The selection
-      // rectangle is reported in viewport CSS pixels regardless of image
-      // resolution, so cropping the original with its natural scale stays
-      // pixel-accurate.
-      const originalCapture = frame.dataUrl;
-      // The frozen preview is the FULL frame - ClipNote sidebar included. The
-      // screenshot is never pre-narrowed to a content target and never stripped
-      // of the sidebar: what the user sees is exactly what the frozen layer
-      // shows and exactly what a plain click saves.
-      const previewCapture = await resizeDataUrl(originalCapture, 1920, 0.82);
-      if (previewCapture.length > MAX_MESSAGE_LENGTH) {
-        setStatus('Screenshot too large to transfer. Try zooming out first.');
-        setTimeout(() => setStatus(''), 4000);
-        return;
-      }
-
-      // 2) Ask the content script to show a STATIC, frozen copy of that capture.
-      //    A plain click saves the WHOLE visible frame (ClipNote included); a
-      //    drag crops to the selected region. The message stays open until the
-      //    user clicks, drags, or cancels.
-      const selRes = await sendToContentScript({
-        type: 'CN_SCREENSHOT_SELECT',
-        dataUrl: previewCapture
-      });
-      // `selRes` is NULL only when the message never got an answer: the
-      // content script dropped it (tab navigated, extension context was
-      // invalidated, or Chrome closed the port mid-selection). That is NOT the
-      // user pressing Esc - a genuine cancel always arrives as the object
-      // {ok:false, cancelled:true} handled in the !selRes.ok branch below.
-      // Distinguishing the two (CN-003) matters because a reloaded page is a
-      // real "reconnect" failure, not a quiet user cancel, and the user must
-      // see that this is a connection problem they need to fix.
-      if (!selRes) {
-        setStatus('Screenshot unavailable \u2014 this page disconnected. Please reload the video tab and try again.');
-        setTimeout(() => setStatus(''), 5000);
-        return;
-      }
-      // The content script refused (e.g. video not ready) - show its reason.
-      if (!selRes.ok) {
-        setStatus(selRes.error || selRes.cancelled ? 'Screenshot cancelled' : 'Screenshot unavailable');
-        setTimeout(() => setStatus(''), 4000);
-        return;
-      }
-      // The user cancelled the selection itself.
-      if (!selRes.rect) {
-        setStatus('Screenshot cancelled');
-        setTimeout(() => setStatus(''), 2500);
-        return;
-      }
-      // 3) Crop the ORIGINAL full-frame capture (from step 1) to the chosen
-      //    rectangle - the whole viewport for a plain click, the dragged region
-      //    otherwise. This is a straight crop of the visible tab: ClipNote is
-      //    part of the saved image whenever the user did not drag it out of the
-      //    region. The result is validated before saving.
-      const cropped = await cropCapturedImage(originalCapture, selRes.rect, selRes.rect.viewport);
-      const cropProbe = await probeCaptureImage(cropped);
-      if (!cropped || !cropProbe || !cropProbe.width || !cropProbe.height) {
-        setStatus('Couldn\u2019t crop the screenshot.');
-        setTimeout(() => setStatus(''), 4000);
-        return;
-      }
-
-      // The timestamp is the video position at selection time. The content
-      // script refuses to select without a playable video, so this is a real
-      // reported position (never a fake 00:00). The Math.max/Number guard is
-      // kept as defensive padding for malformed replies.
-      const timestamp = Math.max(0, Math.floor(Number(selRes.timestamp) || 0));
-      // VIDEO platforms only: a ChatGPT moment is timestamp-free by definition
-      // (no video time, no wall-clock capture time), so it never carries the
-      // timestamp/humanTime fields at all.
-      const selIsChat = !platformHasVideo(selRes.platform || 'youtube');
-
-      // 4) Build a capture object in the EXACT shape + Capture produces and push
-      //    it through the same addCaptureToNote pipeline, so the selected region
-      //    renders as a normal Moment card (thumbnail, note field; timestamp
-      //    link on video platforms only).
-      const cap = {
-        id: uuid(),
-        ...(selIsChat
-          ? {}
-          : {
-              timestamp,
-              humanTime: selRes.humanTime || formatTimestamp(timestamp)
-            }),
-        screenshot: { type: 'data-url', dataUrl: cropped },
-        annotation: '',
-        // The video snapshot reported by the content script at selection time.
-        platform: selRes.platform || '',
-        videoId: selRes.videoId || '',
-        videoUrl: selRes.videoUrl || ''
+  function getContentCaptureRect(plan) {
+    if (plan && plan.target && plan.viewport) {
+      return {
+        x: Math.max(0, plan.target.x),
+        y: Math.max(0, plan.target.y),
+        width: Math.max(0, Math.min(plan.viewport.width, plan.target.x + plan.target.width) - Math.max(0, plan.target.x)),
+        height: Math.max(0, Math.min(plan.viewport.height, plan.target.y + plan.target.height) - Math.max(0, plan.target.y)),
+        viewport: plan.viewport
       };
-      added = await addCaptureToNote(cap, targetNoteId);
-      await saveAllNotes();
-      // The moment is saved and the save is durable. From here on this
-      // invocation only does post-save UI work (re-render + scroll-to-last)
-      // that still belongs to THIS capture, so the lock that blocks a second
-      // screenshot stays on until that tail finishes (CN-005). If anything in
-      // the tail throws it is caught/ignored below; the moment is already safe.
-      // KEEP IN SYNC with the `finally`: that block must NOT release the lock
-      // when this flag is set - the tail is the one releasing it.
-      holdCapturingThroughTail = true;
+    }
+    return plan ? resolveCaptureRect(plan) : null;
+  }
 
-      // Tell the user it worked.
-      setStatus('Screenshot saved');
-      setTimeout(() => setStatus(''), 2500);
-    } catch (e) {
-      // Capture or crop threw (e.g. no permission, invalid rectangle). No
-      // moment was created, so nothing partial is left behind.
-      setStatus('Screenshot failed \u2014 check that this tab is capturable.');
-      setTimeout(() => setStatus(''), 4000);
-    } finally {
-      // No sidebar hide/restore to unwind: the sidebar was never touched. Only
-      // re-enable the buttons - UNLESS this invocation got the moment saved and
-      // then moved on to the post-save UI tail (renderMoments + scrollToLast).
-      // That tail still belongs to this capture, so the lock must survive it
-      // (CN-005 root cause: the tail can't interleave with a second capture)
-      // and is released only after the tail below completes.
-      if (!holdCapturingThroughTail) setCapturing(false);
-    }
-    // Redraw the moments list and wait until the cards are actually in the DOM.
-    // The screenshot is ALREADY saved at this point, so a UI failure here must
-    // never turn into an uncaught rejection that hides a successful save.
+  async function captureContentFrame(tab, plan) {
+    await setHostCaptureMode(true);
     try {
-      await renderMoments();
-    } catch (error) {
-      console.warn('renderMoments failed after successful capture', error);
+      const frame = await captureVisibleFrame(tab);
+      if (frame.threw || !frame.dataUrl) throw new Error('Could not capture the webpage viewport.');
+      const probe = await probeCaptureImage(frame.dataUrl);
+      if (!probe.width || !probe.height) throw new Error('The webpage screenshot was blank.');
+      const rect = getContentCaptureRect(plan);
+      if (!rect) throw new Error('Could not determine the webpage area to capture.');
+      const image = await cropCapturedImage(frame.dataUrl, rect, rect.viewport);
+      if (!image) throw new Error('Could not crop the webpage area.');
+      return { dataUrl: image, rect };
+    } finally {
+      await setHostCaptureMode(false);
     }
-    // Bring the new card into view, but ONLY when the note the screenshot
-    // landed in is still the one on screen - the user may have switched notes
-    // while the screenshot flow was running.
-    if (added && activeNoteId === targetNoteId) {
-      try {
-        await scrollToLast();
-      } catch (error) {
-        console.warn('scrollToLast failed after successful capture', error);
+  }
+
+  async function saveScreenshotMoment(dataUrl, targetNoteId, platform) {
+    const probe = await probeCaptureImage(dataUrl);
+    if (!probe.width || !probe.height) throw new Error('The screenshot image was invalid.');
+    const cap = {
+      id: uuid(),
+      screenshot: { type: 'data-url', dataUrl },
+      annotation: '',
+      platform: platform || 'universal',
+      videoId: '',
+      videoUrl: location.href
+    };
+    const added = await addCaptureToNote(cap, targetNoteId);
+    if (!added) throw new Error('The note was deleted while the screenshot was being saved.');
+    await saveAllNotes();
+    return true;
+  }
+
+  async function chooseScreenshotMode() {
+    const select = $('#cn-shot-mode');
+    return (select && ['visible', 'area', 'full'].includes(select.value)) ? select.value : 'visible';
+  }
+
+  async function captureVisiblePage(tab, plan, noteId) {
+    const frame = await captureContentFrame(tab, plan);
+    await saveScreenshotMoment(frame.dataUrl, noteId, plan.platform);
+  }
+
+  async function captureSelectedArea(tab, plan, noteId) {
+    const frame = await captureContentFrame(tab, plan);
+    const preview = await resizeDataUrl(frame.dataUrl, 1920, 0.82);
+    const rect = await sendToContentScript({
+      type: 'CN_SCREENSHOT_SELECT',
+      dataUrl: preview,
+      target: { x: 0, y: 0, width: window.innerWidth, height: window.innerHeight }
+    });
+    if (!rect || !rect.ok || !rect.rect) {
+      if (rect && rect.cancelled) return false;
+      throw new Error((rect && rect.error) || 'Area selection was cancelled.');
+    }
+    // The captured source is already clipped to webpage pixels. Translate the
+    // selector's crop by the original host-page origin before cropping.
+    const crop = {
+      x: rect.rect.x * (frame.rect.width / rect.rect.viewport.width),
+      y: rect.rect.y * (frame.rect.height / rect.rect.viewport.height),
+      width: rect.rect.width * (frame.rect.width / rect.rect.viewport.width),
+      height: rect.rect.height * (frame.rect.height / rect.rect.viewport.height),
+      viewport: { width: frame.rect.width, height: frame.rect.height }
+    };
+    const selected = await cropCapturedImage(frame.dataUrl, crop, crop.viewport);
+    if (!selected) throw new Error('Could not crop the selected webpage area.');
+    await saveScreenshotMoment(selected, noteId, plan.platform);
+    return true;
+  }
+
+  async function captureFullPage(tab, plan, noteId) {
+    // Full-page capture is implemented for the document/window scroller. Sites
+    // with nested application scrollers must expose a stable page root instead
+    // of silently producing an incomplete stitched image.
+    const root = document.documentElement;
+    const pageWidth = Math.min(root.scrollWidth, window.innerWidth);
+    const pageHeight = Math.max(root.scrollHeight, document.body ? document.body.scrollHeight : 0);
+    if (!pageWidth || !pageHeight) throw new Error('The full webpage dimensions are unavailable.');
+    const originalX = window.scrollX;
+    const originalY = window.scrollY;
+    const columns = [];
+    let stitched = null;
+    try {
+      const contentRect = getContentCaptureRect(plan);
+      if (!contentRect) throw new Error('Could not determine the webpage area to capture.');
+      const step = Math.max(1, window.innerHeight);
+      const maxTiles = Math.ceil(pageHeight / step);
+      if (maxTiles > 40) throw new Error('This page is too long to capture safely in one image.');
+      for (let index = 0; index < maxTiles; index++) {
+        const y = Math.min(index * step, Math.max(0, pageHeight - window.innerHeight));
+        window.scrollTo(0, y);
+        await new Promise(resolve => setTimeout(resolve, 120));
+        const tilePlan = await getScreenshotTarget();
+        const tile = await captureContentFrame(tab, tilePlan || plan);
+        columns.push({ dataUrl: tile.dataUrl, y });
+      }
+      const images = await Promise.all(columns.map(tile => loadImage(tile.dataUrl)));
+      const scale = images[0].naturalWidth / Math.max(1, contentRect.width);
+      const width = Math.round(contentRect.width * scale);
+      const height = Math.round(pageHeight * scale);
+      if (width * height > 64 * 1024 * 1024) throw new Error('The full-page image exceeds the safe size limit.');
+      const canvas = document.createElement('canvas');
+      canvas.width = width;
+      canvas.height = height;
+      const ctx = canvas.getContext('2d');
+      images.forEach((img, index) => {
+        const destY = Math.round(columns[index].y * scale);
+        const remaining = height - destY;
+        if (remaining <= 0) return;
+        // The last tile may overlap the previous tile when the document height
+        // is not an exact multiple of the viewport. Draw only its uncovered tail.
+        const sourceY = index === 0 ? 0 : Math.max(0, Math.round((columns[index - 1].y + window.innerHeight - columns[index].y) * scale));
+        const sourceHeight = Math.min(img.naturalHeight - sourceY, remaining);
+        if (sourceHeight > 0) ctx.drawImage(img, 0, sourceY, img.naturalWidth, sourceHeight, 0, destY + sourceY, width, sourceHeight);
+      });
+      stitched = canvas.toDataURL('image/jpeg', 0.9);
+    } finally {
+      window.scrollTo(originalX, originalY);
+      await setHostCaptureMode(false);
+    }
+    if (!stitched) throw new Error('Could not stitch the full-page screenshot.');
+    await saveScreenshotMoment(stitched, noteId, plan.platform);
+  }
+
+  // Every capture hides the sidebar before taking pixels and restores it in
+  // finally; browser chrome is outside captureVisibleTab's webpage viewport.
+  async function takeScreenshot() {
+    if (capturing) return;
+    const targetNoteId = activeNoteId;
+    if (!targetNoteId || !findNote(targetNoteId)) return;
+    setCapturing(true);
+    let added = false;
+    let mode = 'visible';
+    try {
+      if (!(await ensureCapturePermission())) {
+        setStatus('Screenshot permission was not granted.');
+        return;
+      }
+      const ownTab = await bringOwnTabToFront();
+      if (!ownTab.tab) throw new Error('Could not connect to the webpage tab.');
+      const tab = ownTab.tab;
+      const plan = await getScreenshotTarget();
+      if (!plan || !plan.viewport) throw new Error('Could not read the webpage layout.');
+      mode = await chooseScreenshotMode();
+      if (mode === 'visible') {
+        await captureVisiblePage(tab, plan, targetNoteId);
+        added = true;
+      } else if (mode === 'area') {
+        added = await captureSelectedArea(tab, plan, targetNoteId);
+      } else {
+        await captureFullPage(tab, plan, targetNoteId);
+        added = true;
+      }
+      if (added) setStatus('Screenshot saved');
+      else setStatus('Screenshot cancelled');
+    } catch (error) {
+      console.error('[ClipNote] Screenshot failed:', error);
+      setStatus(error && error.message ? error.message : 'Screenshot failed.');
+    } finally {
+      // Idempotent even if the full-page loop already restored the capture mode.
+      try { await setHostCaptureMode(false); } catch (_) { /* best effort */ }
+      setCapturing(false);
+    }
+    if (added) {
+      try { await renderMoments(); } catch (_) { /* already saved */ }
+      if (activeNoteId === targetNoteId) {
+        try { await scrollToLast(); } catch (_) { /* non-critical */ }
       }
     }
-    // CN-005: ONLY now - after the post-save render/scroll tail - is this
-    // invocation truly finished. Release the capture lock here (the finally
-    // above deliberately skipped it when holdCapturingThroughTail is set), so a
-    // second Screenshot click can never start while this one is still
-    // rendering/scrolling the list.
-    if (holdCapturingThroughTail) setCapturing(false);
+    setTimeout(() => setStatus(''), 3500);
   }
 
   // ----------------------- Views -----------------------

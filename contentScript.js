@@ -262,7 +262,7 @@
     if (host === 'youtube.com' || host === 'www.youtube.com' || host === 'm.youtube.com') return 'youtube';
     if (host === 'udemy.com' || host === 'www.udemy.com') return 'udemy';
     if (host === 'chatgpt.com' || host === 'www.chatgpt.com' || host === 'chat.openai.com') return 'chatgpt';
-    return null;
+    return /^https?:$/.test(location.protocol) ? 'universal' : null;
   }
 
   // The adapter registered by the matching platforms/* module for this host.
@@ -897,7 +897,7 @@
             // or timestamp, so those steps are skipped and the Moment carries
             // the real wall clock instead of a fake video position.
             let ts = 0;
-            if (needsVideo()) {
+            if (needsVideo() && (adapter && adapter.platform) !== 'universal') {
               ts = currentVideoTime();
               if (ts == null) {
                 videoEl = await findVideo(2000);
@@ -932,7 +932,7 @@
               : null;
             const rect = await CN.ScreenshotSelector.start({
               backgroundImage: msg.dataUrl,
-              target
+              target: target || undefined
             });
             // The 3-second window of the overlay is enough for navigation: if
             // the page moved on, never create a Moment against the new video.
@@ -1065,11 +1065,17 @@
             clip = { x: x1, y: y1, width: x2 - x1, height: y2 - y1 };
           }
         }
+        const viewport = { width: window.innerWidth, height: window.innerHeight };
+        let contentRect = target;
+        if (!contentRect && adapter && adapter.platform === 'universal') {
+          const right = clip ? Math.max(0, clip.x) : viewport.width;
+          contentRect = { x: 0, y: 0, width: right, height: viewport.height };
+        }
         sendResponse({
           ok: true,
-          target,
+          target: contentRect,
           clip,
-          viewport: { width: window.innerWidth, height: window.innerHeight },
+          viewport,
           platform: (adapter && adapter.platform) || ''
         });
         return;
