@@ -3299,8 +3299,10 @@ import * as ls from '../local-storage.js';
   async function exportPdf() {
     // Get the open note.
     const note = getActiveNote();
-    // If there's nothing to export, stop.
-    if (!note || !note.moments || note.moments.length === 0) return;
+    // Export captured moments and standalone text blocks. A text-only note
+    // is valid export content too.
+    const textBlocks = Array.isArray(note && note.textBlocks) ? note.textBlocks : [];
+    if (!note || ((!note.moments || note.moments.length === 0) && textBlocks.length === 0)) return;
 
     // Build the HTML for every moment, in the SAME display order the list
     // uses. Blob previews are resolved from the saved file as the blocks are
@@ -3343,6 +3345,13 @@ import * as ls from '../local-storage.js';
     }
     const momentsHtml = blocks.join('\n');
 
+    // Render standalone text blocks into the printable document too.
+    // Escape all user-entered text so it is treated as plain text, not HTML.
+    const textBlocksHtml = textBlocks
+      .filter((block) => typeof block.text === 'string' && block.text.trim())
+      .map((block) => '<div class="pdf-text-block">' + escapeHtml(block.text) + '</div>')
+      .join('\n');
+
     // The title for the document.
     const title = note.title || 'Notes';
 
@@ -3374,10 +3383,24 @@ import * as ls from '../local-storage.js';
   .moment-image img { display: block; max-width: 100%; height: auto; border: 1px solid #ddd; border-radius: 6px; }
   .moment-text { display: flex; flex-direction: column; gap: 8px; }
   .pdf-annotation { font-size: 14px; line-height: 1.6; white-space: pre-wrap; }
+  .pdf-text-block {
+    background: #f5f0eb;
+    color: #2a211c;
+    border: 1px solid #d8c9bd;
+    border-radius: 8px;
+    padding: 14px 16px;
+    margin-bottom: 16px;
+    font-size: 14px;
+    line-height: 1.6;
+    white-space: pre-wrap;
+    overflow-wrap: anywhere;
+    break-inside: avoid;
+  }
 </style></head>
 <body>
   <div class="doc-title">${escapeHtml(title)}</div>
-  ${momentsHtml || '<div>No content to export.</div>'}
+  ${textBlocksHtml}
+  ${momentsHtml || (textBlocksHtml ? '' : '<div>No content to export.</div>')}
 </body></html>`;
 
     // A hidden iframe to hold the printable page.
