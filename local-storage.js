@@ -1270,6 +1270,31 @@ export function normalizeNote(raw, index) {
       createdAt: (typeof block.createdAt === 'number' && Number.isFinite(block.createdAt)) ? block.createdAt : createdAt,
       updatedAt: (typeof block.updatedAt === 'number' && Number.isFinite(block.updatedAt)) ? block.updatedAt : updatedAt
     }));
+  const validMomentIds = new Set(moments.map((moment) => String(moment.id)));
+  const validTextIds = new Set(textBlocks.map((block) => String(block.id)));
+  const contentOrder = Array.isArray(raw.contentOrder)
+    ? raw.contentOrder.filter((entry) => entry && ['moment', 'text'].includes(entry.type) && typeof entry.id === 'string')
+        .map((entry) => ({ type: entry.type, id: entry.id }))
+    : [
+        ...moments.map((moment) => ({ type: 'moment', id: String(moment.id) })),
+        ...textBlocks.map((block) => ({ type: 'text', id: String(block.id) }))
+      ];
+  const seenContent = new Set();
+  const normalizedContentOrder = contentOrder.filter((entry) => {
+    const valid = entry.type === 'moment' ? validMomentIds.has(entry.id) : validTextIds.has(entry.id);
+    const key = entry.type + ':' + entry.id;
+    if (!valid || seenContent.has(key)) return false;
+    seenContent.add(key);
+    return true;
+  });
+  for (const moment of moments) {
+    const key = 'moment:' + String(moment.id);
+    if (!seenContent.has(key)) { normalizedContentOrder.push({ type: 'moment', id: String(moment.id) }); seenContent.add(key); }
+  }
+  for (const block of textBlocks) {
+    const key = 'text:' + String(block.id);
+    if (!seenContent.has(key)) { normalizedContentOrder.push({ type: 'text', id: String(block.id) }); seenContent.add(key); }
+  }
   return {
     ...raw,
     schemaVersion: NOTE_SCHEMA_VERSION,
@@ -1278,6 +1303,7 @@ export function normalizeNote(raw, index) {
     platform,
     moments,
     textBlocks,
+    contentOrder: normalizedContentOrder,
     createdAt,
     updatedAt,
     video: raw.video && typeof raw.video === 'object'
@@ -1341,8 +1367,9 @@ function buildPlaceholderNote(first, sidecar, key, mtimes) {
     conversationId: first.videoId || (sidecar && sidecar.conversationId) || '',
     // No moments yet (we add them below).
     moments: [],
-    // Restore standalone text blocks from the local-folder sidecar.
+    // Restore text blocks and their mixed ordering from the local sidecar.
     textBlocks: Array.isArray(sidecar && sidecar.textBlocks) ? sidecar.textBlocks.map((block) => ({ ...block })) : [],
+    contentOrder: Array.isArray(sidecar && sidecar.contentOrder) ? sidecar.contentOrder.map((entry) => ({ ...entry })) : [],
     // When it was created.
     createdAt,
     // When it was last changed.
@@ -1547,6 +1574,7 @@ export function mergeScannedFiles(parsedFiles, sidecars, existingNotes, mtimes) 
     if (note) {
       // The selected local folder is the authoritative rebuild source.
       if (Array.isArray(sidecar.textBlocks)) note.textBlocks = blocks;
+      if (Array.isArray(sidecar.contentOrder)) note.contentOrder = sidecar.contentOrder.map((entry) => ({ ...entry }));
       continue;
     }
     if (blocks.length === 0) continue;
@@ -1635,6 +1663,11 @@ export async function saveNoteSidecar(note) {
       createdAt: (block && Number.isFinite(block.createdAt)) ? block.createdAt : 0,
       updatedAt: (block && Number.isFinite(block.updatedAt)) ? block.updatedAt : 0
     })),
+    // The mixed timeline stores only item ids; screenshot bytes remain in files.
+    contentOrder: (Array.isArray(note.contentOrder) ? note.contentOrder : [
+      ...(note.moments || []).map((moment) => ({ type: 'moment', id: String(moment.id) })),
+      ...(note.textBlocks || []).map((block) => ({ type: 'text', id: String(block.id) }))
+    ]).map((entry) => ({ type: entry.type, id: String(entry.id) })),
     // Every moment, minus its screenshot blob, mapped back to its file version.
     moments: (note.moments || []).map((m) => ({
       id: (m && m.id) || '',
