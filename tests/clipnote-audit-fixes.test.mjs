@@ -274,7 +274,7 @@ test('Universal manual screenshots are parsed from Screenshots/Universal', () =>
 
 test('Universal storage and legacy sidecar recovery are supported', () => {
   const source = read('local-storage.js');
-  assert.ok(source.includes("shot.platform === 'universal' ? 'Universal' : 'YouTube'));
+  assert.ok(source.includes("shot.platform === 'universal' ? 'Universal' : 'YouTube'");
   assert.ok(source.includes("sidecar.platform === 'universal'"));
   assert.ok(source.includes("return `Universal/${noteId}`"));
 });
@@ -319,6 +319,22 @@ test('Universal notes use a dedicated local folder and parse back for rebuild', 
 test('Universal folder platform is retained by note normalization', () => {
   const normalized = normalizeNote({ id: 'universal-note-2', platform: 'universal', moments: [] }, 0);
   assert.equal(normalized.platform, 'universal');
+});
+
+test('Rebuild recognizes legacy Universal screenshots saved under YouTube/video', () => {
+  const files = [parseRelativePath('YouTube/video/legacy-universal-note/00-00_moment-1.jpg')];
+  const sidecars = new Map([['legacy-universal-note', {
+    noteId: 'legacy-universal-note',
+    platform: 'universal',
+    title: 'Legacy Universal capture',
+    moments: [{ id: 'moment-1', timestamp: 0, humanTime: '00:00' }]
+  }]]);
+  const result = mergeScannedFiles(files, sidecars, [], new Map());
+  const recovered = result.notes.find((note) => note.id === 'legacy-universal-note');
+  assert.ok(recovered);
+  assert.equal(recovered.platform, 'universal');
+  assert.equal(recovered.moments.length, 1);
+  assert.equal(recovered.moments[0].relativePath, 'YouTube/video/legacy-universal-note/00-00_moment-1.jpg');
 });
 
 test('noteFolderRelativePath/relativePathForMoment stay deterministic (no title/date in path)', () => {
