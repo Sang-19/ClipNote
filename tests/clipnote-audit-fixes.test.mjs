@@ -429,6 +429,16 @@ const CHATGPT_SELECTORS = read('platforms/chatgpt/chatgpt-selectors.js');
 const ADAPTER = read('platforms/shared/platform-adapter.js');
 const SELECTOR = read('platforms/shared/screenshot-selector.js');
 
+test('screenshot and text cards share persisted mixed order for display, drag and export', () => {
+  assert.ok(SIDEBAR.includes('function ensureContentOrder(note)'));
+  assert.ok(SIDEBAR.includes('function orderedContentItems(note)'));
+  assert.ok(SIDEBAR.includes('function startUnifiedContentDrag(evt, card)'));
+  assert.ok(SIDEBAR.includes('appendContentOrder(note, \'moment\', momentId)'));
+  assert.ok(SIDEBAR.includes('appendContentOrder(note, \'text\', block.id)'));
+  assert.ok(SIDEBAR.includes('const contentHtml = orderedContentItems(note)'));
+  assert.ok(LOCAL_STORAGE.includes('contentOrder'));
+});
+
 test('text-block drag reordering updates local note order and saves the folder sidecar', () => {
   assert.ok(SIDEBAR.includes('function startTextBlockDrag(evt, card)'));
   assert.ok(SIDEBAR.includes('function computeTextBlockInsertIndex()'));
