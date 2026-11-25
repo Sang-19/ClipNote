@@ -251,6 +251,8 @@ import * as ls from '../local-storage.js';
   let manualShots = [];
   // The active drag-and-drop state (null when not dragging).
   let dragReorder = null;
+  // Independent drag state for standalone text blocks.
+  let textBlockDrag = null;
   // The animation frame id used for auto-scroll while dragging.
   let dragScrollRaf = 0;
   // How many of OUR chrome.storage writes are still in flight. The onChanged
@@ -2848,6 +2850,128 @@ import * as ls from '../local-storage.js';
     previewOverlay = null;
   }
 
+  // ---------------- Standalone text-block drag reordering ----------------
+
+  // Text blocks have their own ordering array, so they can be reordered
+  // without changing screenshot-moment order or capture metadata.
+  function startTextBlockDrag(evt, card) {
+    const note = getActiveNote();
+    if (!note || !Array.isArray(note.textBlocks) || note.textBlocks.length < 2) return;
+    const index = note.textBlocks.findIndex((block) => block.id === card.dataset.textBlockId);
+    if (index < 0) return;
+
+    evt.preventDefault();
+    const handle = card.querySelector('.cn-text-block-handle');
+    const indicator = document.createElement('div');
+    indicator.className = 'cn-drop-indicator';
+    textBlockDrag = {
+      note, card, handle, index, insertIndex: index,
+      startY: evt.clientY, clientY: evt.clientY, indicator
+    };
+    card.classList.add('cn-dragging');
+    momentsList.appendChild(indicator);
+    try { handle.setPointerCapture(evt.pointerId); } catch (e) { /* ignore */ }
+    handle.addEventListener('pointermove', moveTextBlockDrag);
+    handle.addEventListener('pointerup', endTextBlockDrag);
+    handle.addEventListener('pointercancel', cancelTextBlockDrag);
+    updateTextBlockDrag();
+  }
+
+  function moveTextBlockDrag(evt) {
+    if (!textBlockDrag) return;
+    textBlockDrag.clientY = evt.clientY;
+    updateTextBlockDrag();
+  }
+
+  function updateTextBlockDrag() {
+    if (!textBlockDrag) return;
+    const state = textBlockDrag;
+    state.card.style.transform = `translateY(${state.clientY - state.startY}px)`;
+    state.insertIndex = computeTextBlockInsertIndex();
+    placeTextBlockDropIndicator(state.insertIndex);
+  }
+
+  // Find the insertion slot among text blocks only.
+  function computeTextBlockInsertIndex() {
+    const state = textBlockDrag;
+    const total = state.note.textBlocks.length;
+    let insertIndex = state.index;
+    const cards = momentsList.querySelectorAll('.cn-text-block-card');
+    for (const other of cards) {
+      if (other === state.card) continue;
+      const rect = other.getBoundingClientRect();
+      const arrIndex = state.note.textBlocks.findIndex((block) => block.id === other.dataset.textBlockId);
+      if (arrIndex < 0) continue;
+      const baseIndex = arrIndex - (arrIndex > state.index ? 1 : 0);
+      if (state.clientY < rect.top + rect.height / 2) {
+        insertIndex = baseIndex;
+        break;
+      }
+      insertIndex = baseIndex + 1;
+    }
+    return Math.max(0, Math.min(total - 1, insertIndex));
+  }
+
+  function placeTextBlockDropIndicator(slot) {
+    const state = textBlockDrag;
+    if (!state) return;
+    let reference = null;
+    for (const other of momentsList.querySelectorAll('.cn-text-block-card')) {
+      if (other === state.card) continue;
+      const arrIndex = state.note.textBlocks.findIndex((block) => block.id === other.dataset.textBlockId);
+      if (arrIndex < 0) continue;
+      const baseIndex = arrIndex - (arrIndex > state.index ? 1 : 0);
+      if (baseIndex >= slot) {
+        reference = other;
+        break;
+      }
+    }
+    if (reference) {
+      momentsList.insertBefore(state.indicator, reference);
+      return;
+    }
+    // Keep text blocks before screenshot moment cards.
+    const firstMoment = momentsList.querySelector('.cn-note-card:not(.cn-text-block-card)');
+    if (firstMoment) momentsList.insertBefore(state.indicator, firstMoment);
+    else momentsList.appendChild(state.indicator);
+  }
+
+  async function endTextBlockDrag() {
+    const state = textBlockDrag;
+    if (!state) return;
+    cleanupTextBlockDrag();
+    if (state.index === state.insertIndex) return;
+
+    const [moved] = state.note.textBlocks.splice(state.index, 1);
+    state.note.textBlocks.splice(state.insertIndex, 0, moved);
+    state.note.updatedAt = Date.now();
+    state.note.textBlocks.forEach((block, index) => {
+      block.sortOrder = index;
+      block.updatedAt = block.updatedAt || state.note.updatedAt;
+    });
+
+    // Persist both local browser data and the selected local-folder sidecar.
+    await saveAllNotes();
+    await ls.saveNoteSidecar(state.note);
+    await renderMoments();
+  }
+
+  function cancelTextBlockDrag() {
+    cleanupTextBlockDrag();
+  }
+
+  function cleanupTextBlockDrag() {
+    if (!textBlockDrag) return;
+    const state = textBlockDrag;
+    state.card.classList.remove('cn-dragging');
+    state.card.style.transform = '';
+    state.indicator.remove();
+    state.handle.removeEventListener('pointermove', moveTextBlockDrag);
+    state.handle.removeEventListener('pointerup', endTextBlockDrag);
+    state.handle.removeEventListener('pointercancel', cancelTextBlockDrag);
+    textBlockDrag = null;
+  }
+
   // ---------------- Drag-and-drop reordering ----------------
 
   // Begin a card drag when the mouse goes down on a handle.
@@ -3514,8 +3638,10 @@ import * as ls from '../local-storage.js';
       if (!handle) return;
       // The card that owns the handle.
       const card = handle.closest('.cn-note-card');
-      // Begin dragging that card.
-      startDragReorder(evt, card);
+      // Text blocks use their own persisted order; screenshot moments
+      // continue through the existing moment-reorder implementation.
+      if (card.dataset.textBlockId) startTextBlockDrag(evt, card);
+      else startDragReorder(evt, card);
     });
   }
 
