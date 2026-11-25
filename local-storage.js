@@ -36,7 +36,7 @@ const MANUAL_INDEX_NAME = '_clipnote-manual.json';
 // contract: NEW FEATURE MISSING === OPTIONAL FIELD, never an invalid record.
 export const NOTE_SCHEMA_VERSION = 4;
 // The version written into _clipnote-note.json files.
-export const SIDECAR_VERSION = 4;
+export const SIDECAR_VERSION = 5;
 
 // The internal database connection (null until opened).
 let idb = null;
@@ -1244,7 +1244,7 @@ export function normalizeMoment(raw, index, note) {
   };
 }
 
-// Normalize a note into the canonical shape (schema version 4). Fill-in only:
+// Normalize a note into the canonical shape. Fill-in only:
 // missing fields get documented defaults, present fields are never altered, and
 // no moment or note is ever removed because a field is absent or malformed.
 export function normalizeNote(raw, index) {
@@ -1261,6 +1261,15 @@ export function normalizeNote(raw, index) {
     .filter(Boolean);
   const createdAt = (typeof raw.createdAt === 'number' && Number.isFinite(raw.createdAt)) ? raw.createdAt : Date.now();
   const updatedAt = (typeof raw.updatedAt === 'number' && Number.isFinite(raw.updatedAt)) ? raw.updatedAt : createdAt;
+  const textBlocks = (Array.isArray(raw.textBlocks) ? raw.textBlocks : [])
+    .filter((block) => block && typeof block === 'object')
+    .map((block, i) => ({
+      ...block,
+      id: (typeof block.id === 'string' && block.id) ? block.id : `${id}::text-${i}`,
+      text: (typeof block.text === 'string') ? block.text : '',
+      createdAt: (typeof block.createdAt === 'number' && Number.isFinite(block.createdAt)) ? block.createdAt : createdAt,
+      updatedAt: (typeof block.updatedAt === 'number' && Number.isFinite(block.updatedAt)) ? block.updatedAt : updatedAt
+    }));
   return {
     ...raw,
     schemaVersion: NOTE_SCHEMA_VERSION,
@@ -1268,6 +1277,7 @@ export function normalizeNote(raw, index) {
     title: (typeof raw.title === 'string' && raw.title.trim()) ? raw.title : 'Untitled',
     platform,
     moments,
+    textBlocks,
     createdAt,
     updatedAt,
     video: raw.video && typeof raw.video === 'object'
@@ -1331,6 +1341,8 @@ function buildPlaceholderNote(first, sidecar, key, mtimes) {
     conversationId: first.videoId || (sidecar && sidecar.conversationId) || '',
     // No moments yet (we add them below).
     moments: [],
+    // Restore standalone text blocks from the local-folder sidecar.
+    textBlocks: Array.isArray(sidecar && sidecar.textBlocks) ? sidecar.textBlocks.map((block) => ({ ...block })) : [],
     // When it was created.
     createdAt,
     // When it was last changed.
@@ -1362,7 +1374,7 @@ function buildPlaceholderNote(first, sidecar, key, mtimes) {
 // recovered moment/note derives createdAt/updatedAt from it instead of Date.now().
 export function mergeScannedFiles(parsedFiles, sidecars, existingNotes, mtimes) {
   // The list of notes we end up with.
-  const notes = Array.isArray(existingNotes) ? existingNotes.map((n) => ({ ...n, moments: [...(n.moments || [])] })) : [];
+  const notes = Array.isArray(existingNotes) ? existingNotes.map((n) => ({ ...n, moments: [...(n.moments || [])], textBlocks: [...(n.textBlocks || [])] })) : [];
   // How many moments were freshly recovered.
   let added = 0;
   // How many placeholder notes were created.
@@ -1526,6 +1538,38 @@ export function mergeScannedFiles(parsedFiles, sidecars, existingNotes, mtimes) 
       .map((x) => x.m);
   }
 
+  // Sidecars are also a recovery source for text-only notes with no screenshot
+  // files to create a group above.
+  for (const [noteId, sidecar] of (sidecars || new Map())) {
+    if (!noteId || !sidecar) continue;
+    const blocks = Array.isArray(sidecar.textBlocks) ? sidecar.textBlocks.map((block) => ({ ...block })) : [];
+    let note = byId.get(noteId);
+    if (note) {
+      // The selected local folder is the authoritative rebuild source.
+      if (Array.isArray(sidecar.textBlocks)) note.textBlocks = blocks;
+      continue;
+    }
+    if (blocks.length === 0) continue;
+    const platform = ['youtube', 'udemy', 'chatgpt'].includes(sidecar.platform)
+      ? sidecar.platform
+      : (sidecar.course ? 'udemy' : 'youtube');
+    const first = {
+      noteId,
+      platform,
+      videoId: (sidecar.video && sidecar.video.id) || sidecar.conversationId || (sidecar.course && sidecar.course.id) || '',
+      courseId: (sidecar.course && sidecar.course.id) || '',
+      lectureId: (sidecar.lecture && sidecar.lecture.id) || ''
+    };
+    note = buildPlaceholderNote(first, sidecar, `sidecar|${noteId}`, {
+      min: sidecar.createdAt || 0,
+      max: sidecar.updatedAt || 0
+    });
+    note.textBlocks = blocks;
+    notes.push(note);
+    byId.set(noteId, note);
+    createdNotes++;
+  }
+
   // Hand everything back to the caller.
   return { notes, added, createdNotes };
 }
@@ -1560,11 +1604,9 @@ export async function rebuildLibrary(existingNotes) {
 // filesystem can stand alone as a recovery source. Best-effort: a failure here
 // must never block a capture, an annotation save, or a rename.
 //
-// v4 expands the v3 sidecar (which already carried the full moment metadata -
-// timestamps, annotation, ordering, file references - WITHOUT any screenshot
-// image data) with the canonical schema version and the video URL, so a rebuild
-// restores titles, ordering, annotations AND clickable video links from disk
-// alone. v1/v2/v3 sidecars remain fully readable.
+// v5 adds standalone text blocks to the local-folder sidecar, allowing text-only
+// notes to be recovered after browser storage is cleared. Earlier sidecars remain
+// readable.
 export async function saveNoteSidecar(note) {
   // A note id is required for the mapping to be deterministic.
   if (!note || !note.id) return false;
@@ -1586,6 +1628,13 @@ export async function saveNoteSidecar(note) {
     video: note.video ? { id: note.video.id || '', title: note.video.title || '', url: note.video.url || '' } : null,
     course: note.course ? { id: note.course.id || '', slug: note.course.slug || '', title: note.course.title || '' } : null,
     lecture: note.lecture ? { id: note.lecture.id || '', title: note.lecture.title || '' } : null,
+    // Standalone text blocks are plain local text (no screenshot/blob data).
+    textBlocks: (note.textBlocks || []).map((block, index) => ({
+      id: (block && typeof block.id === 'string') ? block.id : `${note.id}::text-${index}`,
+      text: (block && typeof block.text === 'string') ? block.text : '',
+      createdAt: (block && Number.isFinite(block.createdAt)) ? block.createdAt : 0,
+      updatedAt: (block && Number.isFinite(block.updatedAt)) ? block.updatedAt : 0
+    })),
     // Every moment, minus its screenshot blob, mapped back to its file version.
     moments: (note.moments || []).map((m) => ({
       id: (m && m.id) || '',
