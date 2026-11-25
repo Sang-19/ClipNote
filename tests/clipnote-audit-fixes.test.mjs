@@ -266,6 +266,19 @@ test('sidecar annotation/timestamp/order enrich a recovered moment', () => {
 
 // ---------------------------------------------------------------- Fix 11
 
+test('Universal manual screenshots are parsed from Screenshots/Universal', () => {
+  const parsed = parseRelativePath('Screenshots/Universal/2026-11-25_10-30-00_capture-id.jpg');
+  assert.equal(parsed.manualShot, true);
+  assert.equal(parsed.platform, 'universal');
+});
+
+test('Universal storage and legacy sidecar recovery are supported', () => {
+  const source = read('local-storage.js');
+  assert.ok(source.includes("shot.platform === 'universal' ? 'Universal' : 'YouTube'));
+  assert.ok(source.includes("sidecar.platform === 'universal'"));
+  assert.ok(source.includes("return `Universal/${noteId}`"));
+});
+
 test('parseRelativePath classifies manual screenshots correctly', () => {
   const p = parseRelativePath('Screenshots/YouTube/2026-09-17_14-31-00_cafebabe.jpg');
   assert.equal(p.manualShot, true);
@@ -291,6 +304,21 @@ test('parseRelativePath parses v1 and v2 YouTube layouts', () => {
   assert.equal(v1.timestamp, 696);
   const v2 = parseRelativePath('YouTube/video9/n-id/11-36_abc.jpg');
   assert.equal(v2.noteId, 'n-id');
+});
+
+test('Universal notes use a dedicated local folder and parse back for rebuild', () => {
+  const note = { id: 'universal-note-1', platform: 'universal', moments: [] };
+  assert.equal(noteFolderRelativePath(note), 'Universal/universal-note-1');
+  const parsed = parseRelativePath('Universal/universal-note-1/00-00_moment-1.jpg');
+  assert.equal(parsed.platform, 'universal');
+  assert.equal(parsed.noteId, 'universal-note-1');
+  assert.equal(parsed.videoId, '');
+  assert.equal(parsed.timestamp, 0);
+});
+
+test('Universal folder platform is retained by note normalization', () => {
+  const normalized = normalizeNote({ id: 'universal-note-2', platform: 'universal', moments: [] }, 0);
+  assert.equal(normalized.platform, 'universal');
 });
 
 test('noteFolderRelativePath/relativePathForMoment stay deterministic (no title/date in path)', () => {
