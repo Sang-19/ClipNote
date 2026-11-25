@@ -212,6 +212,40 @@ test('ambiguous v1 leftovers land in a stable Recovered bucket, never glued arbi
   assert.ok(r.notes.some((n) => String(n.id).startsWith('recovered-')));
 });
 
+test('normalizeNote preserves and normalizes standalone text blocks', () => {
+  const note = normalizeNote({
+    id: 'text-note', title: 'Text note', platform: 'youtube', moments: [],
+    textBlocks: [{ id: 'tb-1', text: 'Keep this locally', createdAt: 10, updatedAt: 20 }]
+  }, 0);
+  assert.deepEqual(note.textBlocks, [{ id: 'tb-1', text: 'Keep this locally', createdAt: 10, updatedAt: 20 }]);
+});
+
+test('rebuild restores text blocks from sidecar alongside screenshot moments', () => {
+  const files = [parseRelativePath('YouTube/v1/n1/01-30_mom-a.jpg')];
+  const sidecars = new Map([['n1', {
+    noteId: 'n1', title: 'Note with text', platform: 'youtube',
+    textBlocks: [{ id: 'tb-1', text: 'Recovered text', createdAt: 500, updatedAt: 600 }],
+    moments: []
+  }]]);
+  const result = mergeScannedFiles(files, sidecars, []);
+  assert.equal(result.notes[0].textBlocks[0].text, 'Recovered text');
+});
+
+test('rebuild restores a text-only note from sidecar without screenshot files', () => {
+  const sidecars = new Map([['text-only-1', {
+    noteId: 'text-only-1', title: 'Text-only note', platform: 'chatgpt',
+    conversationId: 'conversation-1',
+    video: { id: 'conversation-1', title: 'Chat', url: '' },
+    createdAt: 100, updatedAt: 200,
+    textBlocks: [{ id: 'tb-only', text: 'Survives browser storage reset', createdAt: 100, updatedAt: 200 }]
+  }]]);
+  const result = mergeScannedFiles([], sidecars, []);
+  assert.equal(result.notes.length, 1);
+  assert.equal(result.notes[0].id, 'text-only-1');
+  assert.equal(result.notes[0].title, 'Text-only note');
+  assert.equal(result.notes[0].textBlocks[0].text, 'Survives browser storage reset');
+});
+
 test('sidecar annotation/timestamp/order enrich a recovered moment', () => {
   const files = [parseRelativePath('YouTube/v1/n1/01-30_mom-a.jpg')];
   const sidecars = new Map([[ 'n1', {
