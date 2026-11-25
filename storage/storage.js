@@ -107,6 +107,12 @@ async function renderStats() {
   const pending = ls.countPendingToFolder(notes);
   // A detailed classification of the library against the files on disk.
   const diag = await ls.analyzeLibrary(notes);
+  // Text-only notes are recoverable from sidecars even when no image file
+  // exists, so keep the rebuild path visible for those libraries too.
+  const sidecars = await ls.listNoteSidecars();
+  const hasTextSidecars = [...sidecars.values()].some((entry) =>
+    Array.isArray(entry.textBlocks) && entry.textBlocks.length > 0
+  );
 
   // Paint the three stat cards.
   $('stat-screenshots').textContent = String(diag.files.total);
@@ -144,7 +150,7 @@ async function renderStats() {
   }
 
   // When the database is empty but files exist, highlight the rebuild path.
-  $('rebuild-banner').classList.toggle('hidden', !(notes.length === 0 && diag.files.total > 0));
+  $('rebuild-banner').classList.toggle('hidden', !(notes.length === 0 && (diag.files.total > 0 || hasTextSidecars)));
 }
 
 // Run the folder picker (or re-request permission) then repaint.
