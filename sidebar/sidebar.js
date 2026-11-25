@@ -253,6 +253,8 @@ import * as ls from '../local-storage.js';
   let dragReorder = null;
   // Independent drag state for standalone text blocks.
   let textBlockDrag = null;
+  // Drag state for reordering screenshot and text cards as one timeline.
+  let unifiedContentDrag = null;
   // The animation frame id used for auto-scroll while dragging.
   let dragScrollRaf = 0;
   // How many of OUR chrome.storage writes are still in flight. The onChanged
@@ -949,6 +951,66 @@ import * as ls from '../local-storage.js';
       .map((x) => x.m);
   }
 
+  // One persisted sequence for screenshots and text cards. This is the
+  // authoritative order used by the sidebar, drag-and-drop, export and rebuild.
+  function ensureContentOrder(note) {
+    if (!note) return [];
+    const moments = Array.isArray(note.moments) ? note.moments : [];
+    const textBlocks = Array.isArray(note.textBlocks) ? note.textBlocks : [];
+    const momentIds = new Set(moments.map((m) => String(m.id)));
+    const textIds = new Set(textBlocks.map((b) => String(b.id)));
+    if (!Array.isArray(note.contentOrder)) {
+      const legacyItems = [
+        ...moments.map((m, index) => ({
+          type: 'moment', id: String(m.id),
+          createdAt: Number.isFinite(m.createdAt) ? m.createdAt : (note.createdAt || 0),
+          fallback: index
+        })),
+        ...textBlocks.map((b, index) => ({
+          type: 'text', id: String(b.id),
+          createdAt: Number.isFinite(b.createdAt) ? b.createdAt : (note.createdAt || 0),
+          fallback: moments.length + index
+        }))
+      ];
+      legacyItems.sort((a, b) => (a.createdAt - b.createdAt) || (a.fallback - b.fallback));
+      note.contentOrder = legacyItems.map(({ type, id }) => ({ type, id }));
+    }
+    const seen = new Set();
+    note.contentOrder = note.contentOrder.filter((entry) => {
+      if (!entry || !['moment', 'text'].includes(entry.type) || typeof entry.id !== 'string') return false;
+      const exists = entry.type === 'moment' ? momentIds.has(entry.id) : textIds.has(entry.id);
+      const key = entry.type + ':' + entry.id;
+      if (!exists || seen.has(key)) return false;
+      seen.add(key);
+      return true;
+    });
+    for (const moment of moments) {
+      const key = 'moment:' + String(moment.id);
+      if (!seen.has(key)) { note.contentOrder.push({ type: 'moment', id: String(moment.id) }); seen.add(key); }
+    }
+    for (const block of textBlocks) {
+      const key = 'text:' + String(block.id);
+      if (!seen.has(key)) { note.contentOrder.push({ type: 'text', id: String(block.id) }); seen.add(key); }
+    }
+    return note.contentOrder;
+  }
+
+  function orderedContentItems(note) {
+    const order = ensureContentOrder(note);
+    const momentById = new Map((note.moments || []).map((m) => [String(m.id), m]));
+    const textById = new Map((note.textBlocks || []).map((b) => [String(b.id), b]));
+    return order.map((entry) => ({
+      type: entry.type, id: entry.id,
+      item: entry.type === 'moment' ? momentById.get(entry.id) : textById.get(entry.id)
+    })).filter((entry) => entry.item);
+  }
+
+  function appendContentOrder(note, type, id) {
+    const order = ensureContentOrder(note);
+    const key = type + ':' + String(id);
+    if (!order.some((entry) => entry.type + ':' + entry.id === key)) order.push({ type, id: String(id) });
+  }
+
   // Guards a URL before it is trusted as a link target (PDF timestamp links
   // and momentWatchUrl()). Only http(s) URLs pass; anything else (javascript:,
   // data:, blob:, chrome-extension:, malformed or empty strings) yields '', so
@@ -1139,7 +1201,8 @@ import * as ls from '../local-storage.js';
     // Use the capture's screenshot, or a "none" placeholder.
     const screenshotData = cap.screenshot || { type: 'none' };
 
-    // Add the new moment to the note's list.
+    // Add the new moment and append it to the mixed timeline.
+    appendContentOrder(note, 'moment', momentId);
     note.moments.push({
       // The moment's unique id.
       id: momentId,
@@ -2402,11 +2465,16 @@ import * as ls from '../local-storage.js';
     // Resolutions keyed by moment id for the card loop below.
     const resById = new Map(ordered.map((m, i) => [m.id, resolved[i]]));
 
-    // Render persistent freeform text blocks before captured moments.
+    // Build each card once, then append in the user's mixed content order.
+    const renderedContentCards = new Map();
+
+    // Render text blocks; their final position is determined by contentOrder.
     for (const block of (note.textBlocks || [])) {
       const card = document.createElement('div');
       card.className = 'cn-note-card cn-text-block-card';
       card.dataset.textBlockId = block.id;
+      card.dataset.contentType = 'text';
+      card.dataset.contentId = String(block.id);
       const handle = document.createElement('div');
       handle.className = 'cn-drag-handle cn-text-block-handle';
       handle.textContent = '⋮⋮';
@@ -2448,6 +2516,7 @@ import * as ls from '../local-storage.js';
       remove.addEventListener('click', async () => {
         clearTimeout(saveTimer);
         note.textBlocks = (note.textBlocks || []).filter((item) => item.id !== block.id);
+        note.contentOrder = ensureContentOrder(note).filter((entry) => !(entry.type === 'text' && entry.id === String(block.id)));
         note.updatedAt = Date.now();
         await saveAllNotes();
         await ls.saveNoteSidecar(note);
@@ -2457,7 +2526,7 @@ import * as ls from '../local-storage.js';
       content.appendChild(remove);
       card.appendChild(handle);
       card.appendChild(content);
-      momentsList.appendChild(card);
+      renderedContentCards.set('text:' + String(block.id), card);
     }
 
     // Loop over every moment to build a card.
@@ -2468,6 +2537,8 @@ import * as ls from '../local-storage.js';
       card.className = 'cn-note-card';
       // Remember which moment this card belongs to.
       card.dataset.momentId = moment.id;
+      card.dataset.contentType = 'moment';
+      card.dataset.contentId = String(moment.id);
 
       // The drag handle on the left edge of the card.
       const handle = document.createElement('div');
@@ -2709,8 +2780,8 @@ import * as ls from '../local-storage.js';
       card.appendChild(handle);
       card.appendChild(thumb);
       card.appendChild(content);
-      // Add the finished card to the list.
-      momentsList.appendChild(card);
+      // Store the finished card; append after both item types are built.
+      renderedContentCards.set('moment:' + String(moment.id), card);
 
       // How long a checked-on-disk result is trusted before re-checking (ms).
       const FILE_CHECK_TTL = 30 * 1000;
@@ -2759,6 +2830,12 @@ import * as ls from '../local-storage.js';
           paintMissingWarn(row, moment);
         }).catch(() => { /* ignore */ });
       }
+    }
+
+    // Append screenshot and text cards in the exact user-defined sequence.
+    for (const entry of orderedContentItems(note)) {
+      const card = renderedContentCards.get(entry.type + ':' + entry.id);
+      if (card) momentsList.appendChild(card);
     }
 
     // Release every object URL that is no longer visible (keeps the cache
@@ -2848,6 +2925,106 @@ import * as ls from '../local-storage.js';
     previewOverlay.remove();
     // Forget the reference.
     previewOverlay = null;
+  }
+
+  // ---------------- Unified screenshot/text drag ordering ----------------
+
+  function startUnifiedContentDrag(evt, card) {
+    const note = getActiveNote();
+    const items = orderedContentItems(note);
+    if (!note || items.length < 2) return;
+    const type = card.dataset.contentType;
+    const id = card.dataset.contentId;
+    const index = items.findIndex((entry) => entry.type === type && entry.id === id);
+    if (index < 0) return;
+    evt.preventDefault();
+    const handle = card.querySelector('.cn-drag-handle');
+    const indicator = document.createElement('div');
+    indicator.className = 'cn-drop-indicator';
+    unifiedContentDrag = {
+      note, card, handle, items, index, insertIndex: index,
+      startY: evt.clientY, clientY: evt.clientY, indicator
+    };
+    card.classList.add('cn-dragging');
+    momentsList.appendChild(indicator);
+    try { handle.setPointerCapture(evt.pointerId); } catch (e) { /* ignore */ }
+    handle.addEventListener('pointermove', moveUnifiedContentDrag);
+    handle.addEventListener('pointerup', endUnifiedContentDrag);
+    handle.addEventListener('pointercancel', cancelUnifiedContentDrag);
+  }
+
+  function moveUnifiedContentDrag(evt) {
+    if (!unifiedContentDrag) return;
+    unifiedContentDrag.clientY = evt.clientY;
+    const state = unifiedContentDrag;
+    state.card.style.transform = `translateY(${state.clientY - state.startY}px)`;
+    state.insertIndex = computeUnifiedContentInsertIndex();
+    placeUnifiedContentIndicator(state.insertIndex);
+  }
+
+  function computeUnifiedContentInsertIndex() {
+    const state = unifiedContentDrag;
+    let slot = state.index;
+    for (const other of momentsList.querySelectorAll('.cn-note-card')) {
+      if (other === state.card || !other.dataset.contentType || !other.dataset.contentId) continue;
+      const currentIndex = state.items.findIndex((entry) =>
+        entry.type === other.dataset.contentType && entry.id === other.dataset.contentId);
+      if (currentIndex < 0) continue;
+      const adjusted = currentIndex > state.index ? currentIndex - 1 : currentIndex;
+      const rect = other.getBoundingClientRect();
+      slot = state.clientY < rect.top + rect.height / 2 ? adjusted : adjusted + 1;
+      if (state.clientY < rect.top + rect.height / 2) break;
+    }
+    return Math.max(0, Math.min(state.items.length - 1, slot));
+  }
+
+  function placeUnifiedContentIndicator(slot) {
+    const state = unifiedContentDrag;
+    if (!state) return;
+    let reference = null;
+    for (const other of momentsList.querySelectorAll('.cn-note-card')) {
+      if (other === state.card || !other.dataset.contentType || !other.dataset.contentId) continue;
+      const currentIndex = state.items.findIndex((entry) =>
+        entry.type === other.dataset.contentType && entry.id === other.dataset.contentId);
+      if (currentIndex < 0) continue;
+      const adjusted = currentIndex > state.index ? currentIndex - 1 : currentIndex;
+      if (adjusted >= slot) { reference = other; break; }
+    }
+    if (reference) momentsList.insertBefore(state.indicator, reference);
+    else momentsList.appendChild(state.indicator);
+  }
+
+  async function endUnifiedContentDrag() {
+    const state = unifiedContentDrag;
+    if (!state) return;
+    cleanupUnifiedContentDrag();
+    if (state.index === state.insertIndex) return;
+    const order = ensureContentOrder(state.note);
+    const [moved] = order.splice(state.index, 1);
+    order.splice(state.insertIndex, 0, moved);
+    const momentOrder = order.filter((entry) => entry.type === 'moment').map((entry) => entry.id);
+    state.note.moments.forEach((moment) => {
+      const idx = momentOrder.indexOf(String(moment.id));
+      if (idx >= 0) moment.sortOrder = idx;
+    });
+    state.note.updatedAt = Date.now();
+    await saveAllNotes();
+    await ls.saveNoteSidecar(state.note);
+    await renderMoments();
+  }
+
+  function cancelUnifiedContentDrag() { cleanupUnifiedContentDrag(); }
+
+  function cleanupUnifiedContentDrag() {
+    if (!unifiedContentDrag) return;
+    const state = unifiedContentDrag;
+    state.card.classList.remove('cn-dragging');
+    state.card.style.transform = '';
+    state.indicator.remove();
+    state.handle.removeEventListener('pointermove', moveUnifiedContentDrag);
+    state.handle.removeEventListener('pointerup', endUnifiedContentDrag);
+    state.handle.removeEventListener('pointercancel', cancelUnifiedContentDrag);
+    unifiedContentDrag = null;
   }
 
   // ---------------- Standalone text-block drag reordering ----------------
@@ -3257,6 +3434,7 @@ import * as ls from '../local-storage.js';
     const removed = (note.moments || []).find((m) => m.id === momentId);
     // Keep every moment except the deleted one.
     note.moments = note.moments.filter((m) => m.id !== momentId);
+    note.contentOrder = ensureContentOrder(note).filter((entry) => !(entry.type === 'moment' && entry.id === String(momentId)));
     // Refresh the "last edited" time.
     note.updatedAt = Date.now();
     // Reflect the new positions in the sort orders.
@@ -3433,7 +3611,7 @@ import * as ls from '../local-storage.js';
     // built, so a stored moment's screenshot is never skipped; a moment whose
     // image genuinely can't be resolved still prints its note instead of
     // silently vanishing from the PDF.
-    const blocks = [];
+    const blocksByMomentId = new Map();
     for (const m of momentsInDisplayOrder(note.moments)) {
       // The image HTML for this moment.
       let imgHtml = '';
@@ -3465,16 +3643,18 @@ import * as ls from '../local-storage.js';
         : '';
 
       // Combine everything into one moment block.
-      blocks.push('<div class="moment">\n      <div class="moment-image">' + imgHtml + '</div>\n      <div class="moment-text">' + annHtml + '</div>\n    </div>');
+      blocksByMomentId.set(String(m.id), '<div class="moment">\n      <div class="moment-image">' + imgHtml + '</div>\n      <div class="moment-text">' + annHtml + '</div>\n    </div>');
     }
-    const momentsHtml = blocks.join('\n');
 
-    // Render standalone text blocks into the printable document too.
-    // Escape all user-entered text so it is treated as plain text, not HTML.
-    const textBlocksHtml = textBlocks
-      .filter((block) => typeof block.text === 'string' && block.text.trim())
-      .map((block) => '<div class="pdf-text-block">' + escapeHtml(block.text) + '</div>')
-      .join('\n');
+    // Export screenshots and text blocks in the same order as the sidebar.
+    const textById = new Map(textBlocks.map((block) => [String(block.id), block]));
+    const contentHtml = orderedContentItems(note).map((entry) => {
+      if (entry.type === 'moment') return blocksByMomentId.get(entry.id) || '';
+      const block = textById.get(entry.id);
+      return block && typeof block.text === 'string' && block.text.trim()
+        ? '<div class="pdf-text-block">' + escapeHtml(block.text) + '</div>'
+        : '';
+    }).filter(Boolean).join('\n');
 
     // The title for the document.
     const title = note.title || 'Notes';
@@ -3523,8 +3703,7 @@ import * as ls from '../local-storage.js';
 </style></head>
 <body>
   <div class="doc-title">${escapeHtml(title)}</div>
-  ${textBlocksHtml}
-  ${momentsHtml || (textBlocksHtml ? '' : '<div>No content to export.</div>')}
+  ${contentHtml || '<div>No content to export.</div>'}
 </body></html>`;
 
     // A hidden iframe to hold the printable page.
@@ -3602,6 +3781,7 @@ import * as ls from '../local-storage.js';
       if (!Array.isArray(note.textBlocks)) note.textBlocks = [];
       const block = { id: uuid(), text: '', createdAt: Date.now(), updatedAt: Date.now() };
       note.textBlocks.push(block);
+      appendContentOrder(note, 'text', block.id);
       note.updatedAt = Date.now();
       await saveAllNotes();
       await ls.saveNoteSidecar(note);
@@ -3638,10 +3818,8 @@ import * as ls from '../local-storage.js';
       if (!handle) return;
       // The card that owns the handle.
       const card = handle.closest('.cn-note-card');
-      // Text blocks use their own persisted order; screenshot moments
-      // continue through the existing moment-reorder implementation.
-      if (card.dataset.textBlockId) startTextBlockDrag(evt, card);
-      else startDragReorder(evt, card);
+      // Screenshot and text cards share one mixed, persisted timeline.
+      startUnifiedContentDrag(evt, card);
     });
   }
 
