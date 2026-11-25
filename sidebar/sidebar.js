@@ -2403,44 +2403,58 @@ import * as ls from '../local-storage.js';
     // Render persistent freeform text blocks before captured moments.
     for (const block of (note.textBlocks || [])) {
       const card = document.createElement('div');
-      card.className = 'cn-text-block-card';
+      card.className = 'cn-note-card cn-text-block-card';
       card.dataset.textBlockId = block.id;
-
+      const handle = document.createElement('div');
+      handle.className = 'cn-drag-handle cn-text-block-handle';
+      handle.textContent = '⋮⋮';
+      handle.setAttribute('aria-hidden', 'true');
+      const content = document.createElement('div');
+      content.className = 'cn-text-block-content';
       const textarea = document.createElement('textarea');
       textarea.id = 'cn-text-block-' + block.id;
       textarea.name = 'cn-text-block';
       textarea.setAttribute('aria-label', 'Text block');
       textarea.placeholder = 'Add a note...';
       textarea.value = block.text || '';
-
       let saveTimer = null;
+      const persistTextBlock = async () => {
+        clearTimeout(saveTimer);
+        if (tombstonedNotes.has(note.id) || !allNotes.some((n) => n.id === note.id)) return;
+        await saveAllNotes();
+        // The local-folder sidecar is the recovery copy used by Rebuild Library.
+        await ls.saveNoteSidecar(note);
+      };
       textarea.addEventListener('input', () => {
         block.text = textarea.value;
-        note.updatedAt = Date.now();
+        block.updatedAt = Date.now();
+        note.updatedAt = block.updatedAt;
         clearTimeout(saveTimer);
-        saveTimer = setTimeout(async () => {
-          if (tombstonedNotes.has(note.id) || !allNotes.some((n) => n.id === note.id)) return;
-          await saveAllNotes();
-          await ls.saveNoteSidecar(note);
-        }, 400);
+        saveTimer = setTimeout(() => {
+          persistTextBlock().catch(() => { /* keep editing available if storage is temporarily unavailable */ });
+        }, 350);
       });
-
+      textarea.addEventListener('blur', () => {
+        persistTextBlock().catch(() => { /* best-effort local persistence */ });
+      });
       const remove = document.createElement('button');
       remove.type = 'button';
       remove.className = 'cn-text-block-delete';
-      remove.textContent = '\\uD83D\\uDDD1';
+      remove.textContent = '×';
       remove.title = 'Delete text block';
       remove.setAttribute('aria-label', 'Delete text block');
       remove.addEventListener('click', async () => {
+        clearTimeout(saveTimer);
         note.textBlocks = (note.textBlocks || []).filter((item) => item.id !== block.id);
         note.updatedAt = Date.now();
         await saveAllNotes();
         await ls.saveNoteSidecar(note);
         await renderMoments();
       });
-
-      card.appendChild(textarea);
-      card.appendChild(remove);
+      content.appendChild(textarea);
+      content.appendChild(remove);
+      card.appendChild(handle);
+      card.appendChild(content);
       momentsList.appendChild(card);
     }
 

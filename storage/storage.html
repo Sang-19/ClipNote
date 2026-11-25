@@ -86,7 +86,7 @@
         <div class="rebuild-icon">&#9888;</div>
         <div>
           <div class="folder-name">Local database appears to be empty</div>
-          <div class="folder-meta">but your screenshot folder still contains ClipNote files. Rebuild the library to recover your moments from the files on disk.</div>
+          <div class="folder-meta">but your local ClipNote folder still contains saved screenshot and/or text-block data. Rebuild the library to recover it from the files on disk.</div>
         </div>
         <div class="folder-actions">
           <button id="btn-rebuild-banner" class="btn btn-primary">Rebuild Library</button>
@@ -122,7 +122,7 @@
       </section>
 
       <div class="storage-footnote">
-        <p>Only the original screenshots live in the folder. Notes, timestamps, annotations, ordering and video metadata are also written into each note folder (<code>_clipnote-note.json</code>), so <b>Rebuild Library</b> restores not just the moments but their annotation, time and ordering from the files on disk even after you clear the browser data.</p>
+        <p>Screenshots and standalone text blocks stay in your chosen local folder. Note metadata and text blocks are written into each note folder (<code>_clipnote-note.json</code>), so <b>Rebuild Library</b> can recover text-only notes and their content even after you clear browser storage.</p>
       </div>
     </div>
 
