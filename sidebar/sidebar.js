@@ -224,6 +224,8 @@ import * as ls from '../local-storage.js';
   const noMoments = $('#cn-no-moments');
   // The counter next to "Captured Moments".
   const momentCount = $('#cn-moment-count');
+  // Add a freeform text block to the current note.
+  const addTextBtn = $('#cn-btn-add-text');
   // The "+ Capture" button.
   const btnCapture = $('#cn-btn-capture');
   // The "Screenshot" button (captures a rectangle of the webpage).
@@ -2359,8 +2361,11 @@ import * as ls from '../local-storage.js';
     // Clear the list of cards.
     momentsList.innerHTML = '';
 
+    // Ensure older notes have the optional text-block collection.
+    if (note && !Array.isArray(note.textBlocks)) note.textBlocks = [];
+
     // If there are no moments:
-    if (!note || !note.moments || note.moments.length === 0) {
+    if (!note || ((note.moments || []).length === 0 && (note.textBlocks || []).length === 0)) {
       // Clear the counter.
       momentCount.textContent = '';
       // Show the "no moments" empty state.
@@ -2377,7 +2382,7 @@ import * as ls from '../local-storage.js';
     noMoments.classList.remove('visible');
     // And show the list.
     momentsList.classList.remove('cn-hidden');
-    // Show how many moments there are.
+    // Show the number of captured moments (text blocks are not moments).
     momentCount.textContent = String(note.moments.length);
 
     // Render in display order (saved sortOrder, oldest/missing last) so the
@@ -2394,6 +2399,50 @@ import * as ls from '../local-storage.js';
     if (gen !== renderGeneration) return;
     // Resolutions keyed by moment id for the card loop below.
     const resById = new Map(ordered.map((m, i) => [m.id, resolved[i]]));
+
+    // Render persistent freeform text blocks before captured moments.
+    for (const block of (note.textBlocks || [])) {
+      const card = document.createElement('div');
+      card.className = 'cn-text-block-card';
+      card.dataset.textBlockId = block.id;
+
+      const textarea = document.createElement('textarea');
+      textarea.id = 'cn-text-block-' + block.id;
+      textarea.name = 'cn-text-block';
+      textarea.setAttribute('aria-label', 'Text block');
+      textarea.placeholder = 'Add a note...';
+      textarea.value = block.text || '';
+
+      let saveTimer = null;
+      textarea.addEventListener('input', () => {
+        block.text = textarea.value;
+        note.updatedAt = Date.now();
+        clearTimeout(saveTimer);
+        saveTimer = setTimeout(async () => {
+          if (tombstonedNotes.has(note.id) || !allNotes.some((n) => n.id === note.id)) return;
+          await saveAllNotes();
+          await ls.saveNoteSidecar(note);
+        }, 400);
+      });
+
+      const remove = document.createElement('button');
+      remove.type = 'button';
+      remove.className = 'cn-text-block-delete';
+      remove.textContent = '\\uD83D\\uDDD1';
+      remove.title = 'Delete text block';
+      remove.setAttribute('aria-label', 'Delete text block');
+      remove.addEventListener('click', async () => {
+        note.textBlocks = (note.textBlocks || []).filter((item) => item.id !== block.id);
+        note.updatedAt = Date.now();
+        await saveAllNotes();
+        await ls.saveNoteSidecar(note);
+        await renderMoments();
+      });
+
+      card.appendChild(textarea);
+      card.appendChild(remove);
+      momentsList.appendChild(card);
+    }
 
     // Loop over every moment to build a card.
     for (const moment of ordered) {
@@ -3384,6 +3433,23 @@ import * as ls from '../local-storage.js';
       await storage.set({ [ACTIVE_KEY]: null });
       // Go back to home.
       showHomeView();
+    });
+    // Add a standalone text block without creating a captured moment.
+    addTextBtn.addEventListener('click', async () => {
+      const note = getActiveNote();
+      if (!note) return;
+      if (!Array.isArray(note.textBlocks)) note.textBlocks = [];
+      const block = { id: uuid(), text: '', createdAt: Date.now(), updatedAt: Date.now() };
+      note.textBlocks.push(block);
+      note.updatedAt = Date.now();
+      await saveAllNotes();
+      await ls.saveNoteSidecar(note);
+      await renderMoments();
+      const field = momentsList.querySelector('[data-text-block-id="' + block.id + '"] textarea');
+      if (field) {
+        field.focus();
+        field.scrollIntoView({ block: 'nearest' });
+      }
     });
     // "+ Capture" captures the current frame only.
     btnCapture.addEventListener('click', () => captureMoment());
