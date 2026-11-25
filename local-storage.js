@@ -240,8 +240,14 @@ export function noteFolderRelativePath(note) {
   let platform = 'YouTube';
   if (note && note.platform === 'udemy') platform = 'Udemy';
   else if (note && note.platform === 'chatgpt') platform = 'ChatGPT';
+  else if (note && note.platform === 'universal') platform = 'Universal';
   // The stable note identity (uuid) that owns the folder.
   const noteId = safeSegment(note && note.id, 'note');
+
+  // Universal notes have no video/course identity; use the note id directly.
+  if (platform === 'Universal') {
+    return `Universal/${noteId}`;
+  }
 
   // Udemy notes nest the course and lecture folders.
   if (platform === 'Udemy') {
@@ -371,7 +377,9 @@ export async function saveManualScreenshotFile({ shot }) {
     throw new Error('No screenshot folder connected.');
   }
   // The platform from the top-level folder name.
-  const platform = shot.platform === 'udemy' ? 'Udemy' : 'YouTube';
+  const platform = shot.platform === 'udemy'
+    ? 'Udemy'
+    : (shot.platform === 'universal' ? 'Universal' : 'YouTube');
   // A timestamp-based file name ("yyyy-MM-dd_HH-mm-ss_<id>.jpg").
   const d = new Date(shot.createdAt || Date.now());
   const pad = (n) => String(n).padStart(2, '0');
@@ -1047,12 +1055,13 @@ export async function listImageStats() {
 //   manual:     Screenshots/<Platform>/yyyy-MM-dd_HH-mm-ss_<id>.jpg
 //   ChatGPT:    ChatGPT/<conversationId>/<noteId>/H-MM_<momentId>.jpg  (clock time)
 
-// The platform the top-level folder segment stands for: YouTube, Udemy or
-// ChatGPT. Unknown folders fall back to "youtube" (the legacy default).
+// The platform the top-level folder segment stands for: YouTube, Udemy,
+// ChatGPT or Universal. Unknown folders fall back to "youtube" (legacy).
 function topLevelPlatform(segment) {
   const s = (segment || '').toLowerCase();
   if (s === 'udemy') return 'udemy';
   if (s === 'chatgpt') return 'chatgpt';
+  if (s === 'universal') return 'universal';
   return 'youtube';
 }
 
@@ -1079,7 +1088,7 @@ export function parseRelativePath(relativePath) {
     // WALL CLOCK ("14-31_<momentId>.jpg"), never a video position, so a real
     // video timestamp is NEVER derived for it - it stays 0, exactly like the
     // moment it was saved from.
-    timestamp: (topLevelPlatform(parts[0]) !== 'chatgpt' && match)
+    timestamp: (!['chatgpt', 'universal'].includes(topLevelPlatform(parts[0])) && match)
       ? (parseInt(match[1], 10) * 60 + parseInt(match[2], 10))
       : 0,
     // The seconds count in filename form (a clock time for ChatGPT).
@@ -1101,8 +1110,13 @@ export function parseRelativePath(relativePath) {
     return derived;
   }
 
-  // Udemy keeps two id folders (course + lecture) and, in v2, one note folder.
-  if (derived.platform === 'udemy') {
+  // Universal keeps only the note id under its top-level folder.
+  if (derived.platform === 'universal') {
+    derived.videoId = '';
+    derived.noteId = parts[1] || '';
+    derived.courseId = '';
+    derived.lectureId = '';
+  } else if (derived.platform === 'udemy') {
     // Ugly edge case: keep the original segment casing for ids.
     derived.courseId = parts[1] || '';
     derived.lectureId = parts[2] || '';
@@ -1253,7 +1267,7 @@ export function normalizeNote(raw, index) {
   // A newer schema must never be downgraded by this app's normalization.
   if (typeof raw.schemaVersion === 'number' && raw.schemaVersion > NOTE_SCHEMA_VERSION) return raw;
   const id = (typeof raw.id === 'string' && raw.id) ? raw.id : `note-${Math.max(0, index || 0)}-${(raw.video && raw.video.id) || raw.courseId || 'x'}`;
-  const platform = ['youtube', 'udemy', 'chatgpt'].includes(raw.platform)
+  const platform = ['youtube', 'udemy', 'chatgpt', 'universal'].includes(raw.platform)
     ? raw.platform
     : (raw.course ? 'udemy' : 'youtube');
   const moments = (Array.isArray(raw.moments) ? raw.moments : [])
@@ -1496,7 +1510,12 @@ export function mergeScannedFiles(parsedFiles, sidecars, existingNotes, mtimes) 
       // The sidecar metadata for this note id (when it exists on disk).
       const sidecar = (sidecars && sidecars.get(first.noteId)) || null;
       // Reconstruct the note (v2 keeps its id; only legacy gets a placeholder).
-      note = buildPlaceholderNote(first, sidecar, key, noteRange);
+      // Older Universal notes were accidentally saved under
+      // YouTube/video/<noteId>. Their sidecar identifies the real platform.
+      const recoveredFirst = sidecar && sidecar.platform === 'universal'
+        ? { ...first, platform: 'universal', videoId: '' }
+        : first;
+      note = buildPlaceholderNote(recoveredFirst, sidecar, key, noteRange);
       // Count it as a created note.
       notes.push(note);
       byId.set(note.id, note);
@@ -1587,7 +1606,7 @@ export function mergeScannedFiles(parsedFiles, sidecars, existingNotes, mtimes) 
       continue;
     }
     if (blocks.length === 0) continue;
-    const platform = ['youtube', 'udemy', 'chatgpt'].includes(sidecar.platform)
+    const platform = ['youtube', 'udemy', 'chatgpt', 'universal'].includes(sidecar.platform)
       ? sidecar.platform
       : (sidecar.course ? 'udemy' : 'youtube');
     const first = {
