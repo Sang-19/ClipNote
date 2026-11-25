@@ -430,12 +430,12 @@ const ADAPTER = read('platforms/shared/platform-adapter.js');
 const SELECTOR = read('platforms/shared/screenshot-selector.js');
 
 test('text-block drag reordering updates local note order and saves the folder sidecar', () => {
-  assert.match(SIDEBAR, /function startTextBlockDrag\\(evt, card\\)/);
-  assert.match(SIDEBAR, /function computeTextBlockInsertIndex\\(\\)/);
-  assert.match(SIDEBAR, /state\\.note\\.textBlocks\\.splice\\(state\\.index, 1\\)/);
-  assert.match(SIDEBAR, /state\\.note\\.textBlocks\\.splice\\(state\\.insertIndex, 0, moved\\)/);
-  assert.match(SIDEBAR, /await saveAllNotes\\(\\);\\s*await ls\\.saveNoteSidecar\\(state\\.note\\);/);
-  assert.match(SIDEBAR, /if \\(card\\.dataset\\.textBlockId\\) startTextBlockDrag\\(evt, card\\);/);
+  assert.ok(SIDEBAR.includes('function startTextBlockDrag(evt, card)'));
+  assert.ok(SIDEBAR.includes('function computeTextBlockInsertIndex()'));
+  assert.ok(SIDEBAR.includes('state.note.textBlocks.splice(state.index, 1)'));
+  assert.ok(SIDEBAR.includes('state.note.textBlocks.splice(state.insertIndex, 0, moved)'));
+  assert.ok(SIDEBAR.includes('await saveAllNotes();\\n    await ls.saveNoteSidecar(state.note);'));
+  assert.ok(SIDEBAR.includes('if (card.dataset.textBlockId) startTextBlockDrag(evt, card);'));
 });
 
 test('contentScript exposes the screenshot-target lookup and forwards it to the selector', () => {
