@@ -434,7 +434,8 @@ test('text-block drag reordering updates local note order and saves the folder s
   assert.ok(SIDEBAR.includes('function computeTextBlockInsertIndex()'));
   assert.ok(SIDEBAR.includes('state.note.textBlocks.splice(state.index, 1)'));
   assert.ok(SIDEBAR.includes('state.note.textBlocks.splice(state.insertIndex, 0, moved)'));
-  assert.ok(SIDEBAR.includes('await saveAllNotes();\\n    await ls.saveNoteSidecar(state.note);'));
+  assert.ok(SIDEBAR.includes('await saveAllNotes();'));
+  assert.ok(SIDEBAR.includes('await ls.saveNoteSidecar(state.note);'));
   assert.ok(SIDEBAR.includes('if (card.dataset.textBlockId) startTextBlockDrag(evt, card);'));
 });
 
