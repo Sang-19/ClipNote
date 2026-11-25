@@ -1276,9 +1276,18 @@ export function normalizeNote(raw, index) {
     ? raw.contentOrder.filter((entry) => entry && ['moment', 'text'].includes(entry.type) && typeof entry.id === 'string')
         .map((entry) => ({ type: entry.type, id: entry.id }))
     : [
-        ...moments.map((moment) => ({ type: 'moment', id: String(moment.id) })),
-        ...textBlocks.map((block) => ({ type: 'text', id: String(block.id) }))
-      ];
+        ...moments.map((moment, index) => ({
+          type: 'moment', id: String(moment.id),
+          createdAt: Number.isFinite(moment.createdAt) ? moment.createdAt : createdAt,
+          fallback: index
+        })),
+        ...textBlocks.map((block, index) => ({
+          type: 'text', id: String(block.id),
+          createdAt: Number.isFinite(block.createdAt) ? block.createdAt : createdAt,
+          fallback: moments.length + index
+        }))
+      ].sort((a, b) => (a.createdAt - b.createdAt) || (a.fallback - b.fallback))
+        .map(({ type, id }) => ({ type, id }));
   const seenContent = new Set();
   const normalizedContentOrder = contentOrder.filter((entry) => {
     const valid = entry.type === 'moment' ? validMomentIds.has(entry.id) : validTextIds.has(entry.id);
