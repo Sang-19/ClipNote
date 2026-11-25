@@ -523,6 +523,17 @@ test('the PDF export prints NO timestamps for any platform - annotations only', 
     'the PDF exports the note text alone');
 });
 
+test('PDF export includes standalone text blocks and permits text-only notes', () => {
+  assert.match(SIDEBAR, /const textBlocks = Array\.isArray\(note && note\.textBlocks\)/,
+    'export reads the note text-block collection');
+  assert.match(SIDEBAR, /\.map\(\(block\) => '<div class="pdf-text-block">' \+ escapeHtml\(block\.text\)/,
+    'text blocks are escaped and rendered as printable content');
+  assert.match(SIDEBAR, /\$\{textBlocksHtml\}/,
+    'text blocks are included in the printable document');
+  assert.match(SIDEBAR, /textBlocks\.length === 0/,
+    'a text-only note can be exported');
+});
+
 // ------------------------------------------- sidebar position preserved
 
 // Source-level regression guards for the ChatGPT sidebar jump: while a
